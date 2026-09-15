@@ -123,15 +123,15 @@ async def get_stats(pool: asyncpg.Pool, actor: Actor, period: dict,
 
 # ------------------------------------------------------------- find_calls
 
-async def find_calls(pool: asyncpg.Pool, actor: Actor, filters: dict) -> list[dict]:
-    extension = _scope_extension(actor, filters.get("manager_extension"))
-    period = filters.get("period")
+async def find_calls(pool: asyncpg.Pool, actor: Actor, period: dict | None = None,
+                      manager_extension: str | None = None, level: str | None = None,
+                      limit: int = 20) -> list[dict]:
+    extension = _scope_extension(actor, manager_extension)
     start, end = (None, None)
     if period:
         client = await _require_client(pool, actor.client_id)
         start, end = _period_bounds(client["timezone"], period)
-    level = filters.get("level")
-    limit = min(int(filters.get("limit", 20)), 100)
+    limit = min(int(limit), 100)
 
     rows = await pool.fetch(
         """
@@ -237,6 +237,83 @@ async def get_criteria_breakdown(pool: asyncpg.Pool, actor: Actor, period: dict,
     return {"period": period, "extension": extension, "sample_size": len(rows), "criteria": criteria}
 
 
+# --------------------------------------------------------- successful evidence
+
+async def get_successful_evidence(pool: asyncpg.Pool, actor: Actor, period: dict,
+                                   criterion: str | None = None,
+                                   manager_extension: str | None = None) -> list[dict]:
+    """Цитаты из звонков, где критерий был пройден — сырьё для предложений по
+    скрипту (Этап 3, "удачные отклонения"). Само по себе не решает, что
+    отклонение удачное и повторяющееся у разных менеджеров — это суждение
+    оставлено агенту (сравнить цитаты между менеджерами), а не коду: искать
+    "тот же приём" в свободном тексте кода ненадёжно."""
+    extension = _scope_extension(actor, manager_extension)
+    client = await _require_client(pool, actor.client_id)
+    start, end = _period_bounds(client["timezone"], period)
+
+    rows = await pool.fetch(
+        """
+        SELECT c.extension, a.analysis FROM astra_analysis a JOIN calls c ON c.id = a.call_id
+        WHERE c.client_id = $1 AND a.status = 'analyzed'
+          AND a.updated_at >= $2 AND a.updated_at < $3
+          AND ($4::text IS NULL OR c.extension = $4)
+          AND a.analysis IS NOT NULL
+        """,
+        actor.client_id, start, end, extension,
+    )
+    out = []
+    for r in rows:
+        for row in (json.loads(r["analysis"]).get("rows") or []):
+            if not (row.get("applicable") and row.get("passed") and row.get("evidence")):
+                continue
+            if criterion and row["key"] != criterion:
+                continue
+            out.append({"manager_extension": r["extension"], "criterion": row["title"], "evidence": row["evidence"]})
+    return out
+
+
+# ----------------------------------------------------------- lead diagnosis
+
+async def get_lead_diagnosis_signal(pool: asyncpg.Pool, actor: Actor, period: dict,
+                                     manager_extension: str | None = None) -> dict:
+    """Доля звонков с диагнозом "база" среди тех, где диагноз вообще
+    посчитан. ВАЖНО: diagnosis.type считается только из detailed_report —
+    подробный разбор строится лениво, по клику "Подробный разбор" в
+    Telegram, а не для каждого звонка (так решили специально, чтобы втрое
+    снизить расход на API). Поэтому sample здесь — не все звонки периода, а
+    только те, что кто-то уже открыл подробно. Агент обязан явно предупредить
+    об этом смещении выборки, а не выдавать долю как статистику по всем звонкам."""
+    extension = _scope_extension(actor, manager_extension)
+    client = await _require_client(pool, actor.client_id)
+    start, end = _period_bounds(client["timezone"], period)
+
+    rows = await pool.fetch(
+        """
+        SELECT a.detailed_report FROM astra_analysis a JOIN calls c ON c.id = a.call_id
+        WHERE c.client_id = $1 AND a.status = 'analyzed'
+          AND a.updated_at >= $2 AND a.updated_at < $3
+          AND ($4::text IS NULL OR c.extension = $4)
+          AND a.detailed_report IS NOT NULL
+        """,
+        actor.client_id, start, end, extension,
+    )
+    types: dict[str, int] = {}
+    for r in rows:
+        t = (json.loads(r["detailed_report"]).get("diagnosis") or {}).get("type")
+        if t:
+            types[t] = types.get(t, 0) + 1
+    reviewed = len(rows)
+    return {
+        "period": period, "extension": extension,
+        "reviewed_calls": reviewed,
+        "diagnosis_counts": types,
+        "base_share": round(types.get("база", 0) / reviewed, 3) if reviewed else None,
+        "sample_caveat": ("Это не все звонки периода, а только те, где кто-то запросил "
+                           "«Подробный разбор» — подробный разбор считается не для каждого "
+                           "звонка автоматически. При маленьком reviewed_calls вывод ненадёжен."),
+    }
+
+
 # ------------------------------------------------------------- схемы для LLM
 
 _PERIOD_SCHEMA = {
@@ -301,6 +378,39 @@ TOOL_SCHEMAS = [
     {
         "name": "get_criteria_breakdown",
         "description": "Разбивка по критериям оценки за период: сколько раз критерий был применим и сколько раз провален, отсортировано по доле провала.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "period": _PERIOD_SCHEMA,
+                "manager_extension": {"type": ["string", "null"]},
+            },
+            "required": ["period"],
+        },
+    },
+    {
+        "name": "get_successful_evidence",
+        "description": ("Цитаты из звонков, где конкретный критерий был пройден — сырьё для идей по скрипту. "
+                         "Сам инструмент не решает, какой приём удачный и повторяющийся — сравнивай цитаты "
+                         "между разными manager_extension самостоятельно, прежде чем предлагать правку сценария, "
+                         "и не предлагай правку по одной цитате от одного менеджера."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "period": _PERIOD_SCHEMA,
+                "criterion": {"type": ["string", "null"],
+                              "description": "Ключ критерия (например insight, call_reason); null — все критерии"},
+                "manager_extension": {"type": ["string", "null"]},
+            },
+            "required": ["period"],
+        },
+    },
+    {
+        "name": "get_lead_diagnosis_signal",
+        "description": ("Доля звонков с диагнозом «база» (проблема в качестве лидов, не в менеджере) за период. "
+                         "ВАЖНО: считается только по звонкам, где кто-то уже открывал «Подробный разбор» — это "
+                         "не полная выборка периода. Всегда сообщай reviewed_calls и sample_caveat из ответа, "
+                         "если используешь этот сигнал в выводах, и не утверждай долю как относящуюся ко всем "
+                         "звонкам периода."),
         "input_schema": {
             "type": "object",
             "properties": {

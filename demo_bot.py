@@ -19,6 +19,8 @@ from analysis import analyze, review_call
 # алиасы: у этого файла уже есть свои render_head/render_manager (старый ручной
 # аплоад) — импорт под своими именами их бы тихо подменил
 from reports import detail_button, fmt_call_time, render_head as pg_render_head, render_manager as pg_render_manager
+import rop_agent
+from tools import resolve_actor
 
 BOT_TOKEN=os.environ['BOT_TOKEN']; DG_KEY=os.environ['DEEPGRAM_API_KEY']
 DB_PATH=ROOT/os.getenv('DATABASE_PATH','callbot.sqlite3')
@@ -287,6 +289,32 @@ async def stats_command(message):
           '\n\n<b>Топ штампов</b>\n'+top_cliches+
           '\n\nРасходы: '+format(cost,'.0f')+' / '+format(MAX_COST,'.0f')+' ед.')
     await send_chunks(message.bot,message.chat.id,text)
+
+# ------------------------------------------------------------ агент РОПа
+
+@router.message(F.text)
+async def rop_question(message: Message):
+    """Свободный вопрос агенту РОПа (Этап 3). Регистрируется после команд —
+    aiogram отдаёт сообщение сюда только если ни один Command()/CommandStart()
+    фильтр выше не совпал. Actor резолвится по telegram_user_id из employees;
+    если человек не сотрудник ни одного клиента — молчим, а не отвечаем как
+    попало."""
+    if PG_POOL is None:
+        return
+    actor = await resolve_actor(PG_POOL, message.from_user.id)
+    if actor is None:
+        return
+    status = await message.answer('Секунду, смотрю данные…')
+    try:
+        text = await rop_agent.answer(PG_POOL, actor, message.text or '')
+    except Exception:
+        log.exception('ошибка агента РОПа, telegram_user_id=%s', message.from_user.id)
+        text = 'Не получилось обработать вопрос, попробуйте ещё раз.'
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await send_chunks(message.bot, message.chat.id, text)
 
 def media_from(message):
     media=message.voice or message.audio or message.document

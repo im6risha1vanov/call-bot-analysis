@@ -136,6 +136,7 @@ async def main() -> None:
     # Импорт регистрирует обработчики декоратором @register — сам раннер про
     # конкретные типы задач ничего не знает.
     import handlers.analyze_call  # noqa: F401
+    import handlers.rop_digest  # noqa: F401
 
     pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=5)
     await reset_orphaned(pool)

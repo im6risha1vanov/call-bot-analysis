@@ -240,6 +240,67 @@ async def sweep_timeouts(pool: asyncpg.Pool) -> None:
         log.info("таймаут ожидания записи: %s", result)
 
 
+# ------------------------------------------------------- дайджесты агента РОПа
+
+# Этап 3: 9:00 три темы на планёрку, понедельник 10:00 сводка за неделю, 1
+# число 10:00 отчёт собственнику. Этот процесс только кладёт задачи в общую
+# очередь (tasks) — сам вопрос агенту РОПа и отправка ответа в Telegram
+# делает обработчик handlers/rop_digest.py в queue_runner. Планировщик и
+# исполнитель не общаются напрямую, только через таблицу — тот же принцип,
+# что и у analyze_call.
+
+ROP_DIGEST_GRACE_HOURS = 2
+
+
+async def maybe_enqueue_rop_digest_for_client(pool: asyncpg.Pool, client: asyncpg.Record) -> None:
+    tz = ZoneInfo(client["timezone"])
+    now_local = datetime.now(tz)
+    if now_local.weekday() >= 5:
+        return
+
+    candidates = [("morning", dtime(9, 0))]
+    if now_local.weekday() == 0:
+        candidates.append(("weekly", dtime(10, 0)))
+    if now_local.day == 1:
+        candidates.append(("monthly", dtime(10, 0)))
+
+    for kind, at in candidates:
+        target = datetime.combine(now_local.date(), at, tzinfo=tz)
+        if not (target <= now_local < target + timedelta(hours=ROP_DIGEST_GRACE_HOURS)):
+            continue
+        state = await pool.fetchrow(
+            "SELECT * FROM rop_digest_state WHERE client_id=$1 AND kind=$2", client["id"], kind
+        )
+        if state and state["last_sent_date"] == now_local.date():
+            continue
+        await pool.execute(
+            """
+            INSERT INTO tasks (type, client_id, input, dedup_key)
+            VALUES ($1, $2, $3::jsonb, $4)
+            ON CONFLICT (type, dedup_key) DO NOTHING
+            """,
+            f"rop_digest_{kind}", client["id"], json.dumps({"client_id": client["id"]}),
+            f"{kind}:{client['id']}:{now_local.date().isoformat()}",
+        )
+        await pool.execute(
+            """
+            INSERT INTO rop_digest_state (client_id, kind, last_sent_date) VALUES ($1, $2, $3)
+            ON CONFLICT (client_id, kind) DO UPDATE SET last_sent_date = EXCLUDED.last_sent_date
+            """,
+            client["id"], kind, now_local.date(),
+        )
+        log.info("client id=%s поставлена задача rop_digest_%s", client["id"], kind)
+
+
+async def maybe_enqueue_rop_digests(pool: asyncpg.Pool) -> None:
+    clients = await pool.fetch("SELECT * FROM clients WHERE processing_enabled = true")
+    for client in clients:
+        try:
+            await maybe_enqueue_rop_digest_for_client(pool, client)
+        except Exception:
+            log.exception("ошибка планировщика дайджестов РОПа, client id=%s", client["id"])
+
+
 # -------------------------------------------------------------------- дайджест
 
 LEVELS = ("✅", "❌", "❌❌")
@@ -445,6 +506,7 @@ async def main() -> None:
             if now - last_sweep > SWEEP_INTERVAL_SEC:
                 await sweep_timeouts(pool)
                 await maybe_send_digests(pool)
+                await maybe_enqueue_rop_digests(pool)
                 last_sweep = now
             await asyncio.sleep(POLL_INTERVAL_SEC)
     finally:
