@@ -149,5 +149,9 @@ async def main() -> None:
         await pool.close()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# Точку входа держим в отдельном run_queue_runner.py, а не здесь: если этот
+# файл запустить напрямую (`python queue_runner.py`), он попадёт в
+# sys.modules как "__main__", а handlers/analyze_call.py импортирует его как
+# "queue_runner" — Python создаст ВТОРОЙ, независимый экземпляр модуля со
+# своим пустым _REGISTRY, и раннер не увидит ни одного обработчика (проверено
+# на проде: "обработчики: []" при живом @register в analyze_call.py).
