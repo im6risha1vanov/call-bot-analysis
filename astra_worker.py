@@ -1,24 +1,19 @@
 """
-Полностью самостоятельный конвейер Astra — не зависит от /opt/callbot
-(Claude-бот отключён). Свой опрос Mango, своя транскрибация через Deepgram,
-свой анализ и доставка. Отдельный процесс, systemd-юнит callbot-astra-worker.
+Опрос Mango + доставка дайджестов для Astra-конвейера. Сам разбор звонка
+(транскрибация, оценка, немедленная доставка) больше не выполняется в этом
+процессе — с Этапа 1 мультиагентной шины это обработчик очереди
+`analyze_call` (handlers/analyze_call.py), который забирает задачи через
+queue_runner.py. Здесь остаётся только: опрос Mango и постановка задач в
+очередь, heartbeat, sweep таймаутов записи, вечерний дайджест.
 
-Источник звонков — ОПРОС Mango (poll_client_calls), не вебхуки — та же
-причина, что и была у Claude-стороны: push-вебхуки платные, базовый API
-(stats/calls/request + result) бесплатный и уже используется.
+Источник звонков — ОПРОС Mango (poll_client_calls), не вебхуки — push-вебхуки
+у Mango платные, базовый API (stats/calls/request + result) бесплатный и уже
+используется.
 
-Опрос — раз в client.mango_poll_interval_sec (сейчас выставлено 900 сек = 15
-минут, по явной просьбе — специально реже, чем было у Claude, поскольку
-здесь этот интервал ничего не экономит по деньгам, только частоту опроса).
-После каждого цикла опроса — heartbeat-сообщение РОПу в Telegram: воркер
-реально проверяет Mango, а не тихо стоит (см. историю с часовым поясом —
-опрос молчал сутками, ничего не показывая в логах как сломанное).
-
-Очередь на обработку — SELECT ... FOR UPDATE SKIP LOCKED в Postgres, как и
-было у Claude-воркера. calls — общая таблица схемы (ею раньше владел
-Claude-воркер, теперь пишет сюда только этот процесс); astra_analysis —
-результаты именно Astra-анализа (score/level/short_report/detailed_report),
-отдельно от сырых данных звонка.
+Опрос — раз в client.mango_poll_interval_sec (900 сек = 15 минут). После
+каждого цикла опроса — heartbeat-сообщение РОПу в Telegram: воркер реально
+проверяет Mango, а не тихо стоит (см. историю с часовым поясом — опрос молчал
+сутками, ничего не показывая в логах как сломанное).
 """
 
 import asyncio
@@ -34,11 +29,9 @@ import asyncpg
 from aiogram import Bot
 
 import mango_client
-from analysis import CRITERIA, score_call, short_report_call
+from analysis import CRITERIA
 from crypto_util import decrypt
-from deepgram_client import close as close_deepgram
-from deepgram_client import transcribe_bytes
-from reports import detail_button, esc, fmt_call_time, render_short, send_long, send_short_report
+from reports import esc, send_long
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("callbot-astra-worker")
@@ -47,7 +40,6 @@ bot = Bot(token=os.environ["BOT_TOKEN"])
 
 POLL_INTERVAL_SEC = 5
 SWEEP_INTERVAL_SEC = 60
-BUDGET_RECHECK_MIN = 30
 DIGEST_GRACE_HOURS = 2
 
 POLL_OVERLAP_MIN = 3
@@ -55,14 +47,6 @@ INITIAL_LOOKBACK_MIN = 60
 MAX_LOOKBACK_DAYS = 25
 STATS_RESULT_MAX_ATTEMPTS = 10
 STATS_RESULT_RETRY_SEC = 2
-
-BACKOFF_MINUTES = [2, 10, 30, 60, 120]
-MAX_ATTEMPTS = len(BACKOFF_MINUTES)
-
-DG_PRICE_PER_MIN_USD = 0.0043  # nova-3, предзаписанное аудио — только для лога, не бюджетный гейт
-
-# Пер-клиентский дневной потолок расхода в "кредит-единицах" Astra.
-DAILY_UNIT_LIMIT = float(os.getenv("MAX_COST_PER_CHAT_UNITS", "2000000"))
 
 
 def _day_bounds(client: asyncpg.Record, offset_days: int = 0) -> tuple[datetime, datetime]:
@@ -109,6 +93,20 @@ async def _fetch_calls_window(vpbx_api_key: str, salt: str, start: datetime, end
     raise RuntimeError("stats/calls/result не дождались 'complete'")
 
 
+async def _enqueue_analyze_call(pool: asyncpg.Pool, client_id: int, call_row_id: int, mango_entry_id: str) -> None:
+    """Ключ дедупликации — идентификатор звонка в Манго: при пересечении окон
+    опроса (POLL_OVERLAP_MIN) один и тот же звонок может встретиться повторно,
+    но задача для него будет поставлена только один раз."""
+    await pool.execute(
+        """
+        INSERT INTO tasks (type, client_id, input, dedup_key)
+        VALUES ('analyze_call', $1, $2::jsonb, $3)
+        ON CONFLICT (type, dedup_key) DO NOTHING
+        """,
+        client_id, json.dumps({"call_id": call_row_id}), mango_entry_id,
+    )
+
+
 async def poll_client_calls(pool: asyncpg.Pool, client: asyncpg.Record) -> tuple[int, int]:
     """Возвращает (найдено всего, пойдёт в разбор) — для heartbeat-сообщения."""
     tz = ZoneInfo(client["timezone"])
@@ -153,7 +151,7 @@ async def poll_client_calls(pool: asyncpg.Pool, client: asyncpg.Record) -> tuple
         if new_status != "skipped":
             to_analyze += 1
 
-        await pool.execute(
+        row_id = await pool.fetchval(
             """
             INSERT INTO calls (client_id, external_id, direction, extension, client_number,
                                 duration_seconds, recording_id, status, raw_summary, call_started_at)
@@ -171,10 +169,14 @@ async def poll_client_calls(pool: asyncpg.Pool, client: asyncpg.Record) -> tuple
                     THEN calls.status ELSE EXCLUDED.status
                 END,
                 updated_at = now()
+            RETURNING id
             """,
             client["id"], entry_id, direction, extension, client_number,
             duration, recording_id, new_status, json.dumps(c, ensure_ascii=False), call_started_at,
         )
+
+        if new_status == "new":
+            await _enqueue_analyze_call(pool, client["id"], row_id, entry_id)
 
     await pool.execute("UPDATE clients SET last_call_synced_at=$2 WHERE id=$1", client["id"], now_utc)
     if calls:
@@ -188,9 +190,7 @@ async def _send_heartbeat(pool: asyncpg.Pool, client: asyncpg.Record, found: int
     (как было с часовым поясом у Claude-стороны) молчит сутками, ничего не
     показывая в чате. found — все записи от Mango за окно (включая входящие,
     короткие и не по нужным добавочным); to_analyze — сколько из них реально
-    пойдут в разбор. Раньше heartbeat показывал только found — выглядело как
-    «звонок пропал», хотя он был корректно отфильтрован (не исходящий /
-    слишком короткий / не тот добавочный)."""
+    пойдут в разбор."""
     head_id = await _head_chat_id(pool, client["id"])
     if not head_id:
         return
@@ -238,196 +238,6 @@ async def sweep_timeouts(pool: asyncpg.Pool) -> None:
     )
     if result != "UPDATE 0":
         log.info("таймаут ожидания записи: %s", result)
-
-
-async def reset_orphaned(pool: asyncpg.Pool) -> None:
-    result = await pool.execute("UPDATE calls SET status='new', updated_at=now() WHERE status='processing'")
-    if result != "UPDATE 0":
-        log.warning("восстановлены зависшие processing-строки после перезапуска: %s", result)
-    result = await pool.execute("UPDATE astra_analysis SET status='new' WHERE status='processing'")
-    if result != "UPDATE 0":
-        log.warning("восстановлены зависшие processing-строки astra_analysis: %s", result)
-
-
-# -------------------------------------------------------------------- очередь
-
-async def claim_next(pool: asyncpg.Pool) -> asyncpg.Record | None:
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                """
-                SELECT c.* FROM calls c
-                JOIN clients cl ON cl.id = c.client_id
-                WHERE c.status = 'new'
-                  AND cl.processing_enabled = true
-                  AND (c.next_attempt_at IS NULL OR c.next_attempt_at <= now())
-                ORDER BY c.created_at
-                FOR UPDATE OF c SKIP LOCKED
-                LIMIT 1
-                """
-            )
-            if row:
-                await conn.execute("UPDATE calls SET status='processing', updated_at=now() WHERE id=$1", row["id"])
-                await conn.execute(
-                    "INSERT INTO astra_analysis (call_id, status) VALUES ($1,'processing') "
-                    "ON CONFLICT (call_id) DO UPDATE SET status='processing'",
-                    row["id"],
-                )
-    return row
-
-
-async def over_daily_limit(pool: asyncpg.Pool, client: asyncpg.Record) -> bool:
-    spent = await pool.fetchval(
-        "SELECT spent_units FROM astra_daily_spend WHERE client_id=$1 AND day=$2",
-        client["id"], datetime.now(ZoneInfo(client["timezone"])).date(),
-    )
-    return float(spent or 0) >= DAILY_UNIT_LIMIT
-
-
-async def add_spend(pool: asyncpg.Pool, client: asyncpg.Record, units: float) -> None:
-    await pool.execute(
-        """
-        INSERT INTO astra_daily_spend (client_id, day, spent_units) VALUES ($1, $2, $3)
-        ON CONFLICT (client_id, day) DO UPDATE SET spent_units = astra_daily_spend.spent_units + EXCLUDED.spent_units
-        """,
-        client["id"], datetime.now(ZoneInfo(client["timezone"])).date(), units,
-    )
-
-
-async def fail_or_retry(pool: asyncpg.Pool, call: asyncpg.Record, exc: Exception) -> None:
-    attempts = call["attempts"] + 1
-    if attempts >= MAX_ATTEMPTS:
-        log.error("call id=%s окончательно провалена после %s попыток: %s", call["id"], attempts, exc)
-        await pool.execute("UPDATE calls SET status='failed', attempts=$2, updated_at=now() WHERE id=$1",
-                            call["id"], attempts)
-        await pool.execute("UPDATE astra_analysis SET status='failed', error=$2 WHERE call_id=$1",
-                            call["id"], str(exc)[:2000])
-        return
-    delay = timedelta(minutes=BACKOFF_MINUTES[attempts - 1])
-    log.warning("call id=%s попытка %s не удалась (%s), повтор через %s", call["id"], attempts, exc, delay)
-    await pool.execute(
-        "UPDATE calls SET status='new', attempts=$2, next_attempt_at=now()+$3, updated_at=now() WHERE id=$1",
-        call["id"], attempts, delay,
-    )
-    await pool.execute("UPDATE astra_analysis SET status='new' WHERE call_id=$1", call["id"])
-
-
-# ------------------------------------------------------------------ доставка
-
-async def manager_immediate_count_today(pool: asyncpg.Pool, client: asyncpg.Record, extension: str) -> int:
-    start, end = _day_bounds(client)
-    return await pool.fetchval(
-        """SELECT count(*) FROM astra_analysis a JOIN calls c ON c.id = a.call_id
-           WHERE c.client_id=$1 AND c.extension=$2 AND a.immediate_sent_manager=true
-             AND a.updated_at >= $3 AND a.updated_at < $4""",
-        client["id"], extension, start, end,
-    )
-
-
-async def head_immediate_count_today(pool: asyncpg.Pool, client: asyncpg.Record) -> int:
-    start, end = _day_bounds(client)
-    return await pool.fetchval(
-        """SELECT count(*) FROM astra_analysis a JOIN calls c ON c.id = a.call_id
-           WHERE c.client_id=$1 AND a.immediate_sent_head=true
-             AND a.updated_at >= $2 AND a.updated_at < $3""",
-        client["id"], start, end,
-    )
-
-
-async def deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: asyncpg.Record,
-                             short_report: dict, level: str | None) -> None:
-    if level != "❌❌":
-        return
-
-    call_time = fmt_call_time(call["call_started_at"], client["timezone"])
-
-    manager = await pool.fetchrow(
-        "SELECT * FROM employees WHERE client_id=$1 AND extension=$2 AND role='manager'",
-        client["id"], call["extension"],
-    )
-
-    if manager and manager["telegram_user_id"]:
-        if await manager_immediate_count_today(pool, client, call["extension"]) < client["max_immediate_per_manager"]:
-            try:
-                text = render_short(short_report, level, call["duration_seconds"] or 0, call_time=call_time)
-                await send_short_report(bot, manager["telegram_user_id"], text, detail_button(call["id"], source="astra"))
-                await pool.execute(
-                    "UPDATE astra_analysis SET immediate_sent_manager=true, updated_at=now() WHERE call_id=$1", call["id"]
-                )
-            except Exception:
-                log.exception("не удалось отправить менеджеру, call id=%s", call["id"])
-
-    head = await pool.fetchrow("SELECT * FROM employees WHERE client_id=$1 AND role='head'", client["id"])
-    if head and head["telegram_user_id"]:
-        if await head_immediate_count_today(pool, client) < client["max_immediate_per_head"]:
-            manager_name = (manager["full_name"] if manager else None) or f"доб. {call['extension']}"
-            try:
-                text = render_short(short_report, level, call["duration_seconds"] or 0, manager_name, call_time=call_time)
-                if not (manager and manager["telegram_user_id"]):
-                    text += (f"\n\n⚠️ Менеджер (доб. {esc(call['extension'])}) не подключён к боту — личный "
-                             f"разбор не отправлен.")
-                await send_short_report(bot, head["telegram_user_id"], text, detail_button(call["id"], source="astra"))
-                await pool.execute(
-                    "UPDATE astra_analysis SET immediate_sent_head=true, updated_at=now() WHERE call_id=$1", call["id"]
-                )
-            except Exception:
-                log.exception("не удалось отправить РОПу, call id=%s", call["id"])
-
-
-# ------------------------------------------------------------------ обработка
-
-async def process_call(pool: asyncpg.Pool, call: asyncpg.Record) -> None:
-    client = await pool.fetchrow("SELECT * FROM clients WHERE id=$1", call["client_id"])
-
-    if await over_daily_limit(pool, client):
-        log.warning("client id=%s превысил дневной лимит, call id=%s отложен", client["id"], call["id"])
-        await pool.execute(
-            "UPDATE calls SET status='new', next_attempt_at=now()+$2, updated_at=now() WHERE id=$1",
-            call["id"], timedelta(minutes=BUDGET_RECHECK_MIN),
-        )
-        return
-
-    try:
-        vpbx_api_key = decrypt(client["vpbx_api_key_enc"])
-        vpbx_api_salt = decrypt(client["vpbx_api_salt_enc"])
-
-        audio = await mango_client.fetch_recording(vpbx_api_key, vpbx_api_salt, call["recording_id"])
-        transcript, dg_duration = await transcribe_bytes(audio)
-        del audio
-
-        scores, score, level, rows, cost = await score_call(transcript)
-        short_report, short_cost = await short_report_call(transcript, scores, rows, level)
-        cost += short_cost
-        analysis = {**scores, "rows": rows}
-
-        await add_spend(pool, client, cost)
-        log.info("Deepgram (справочно, не в бюджете Astra): $%.4f", dg_duration / 60 * DG_PRICE_PER_MIN_USD)
-
-    except Exception as exc:
-        log.exception("ошибка обработки call id=%s", call["id"])
-        await fail_or_retry(pool, call, exc)
-        return
-
-    await pool.execute(
-        "UPDATE calls SET transcript=$2, status='analyzed', updated_at=now() WHERE id=$1",
-        call["id"], transcript,
-    )
-    await pool.execute(
-        """
-        UPDATE astra_analysis SET
-            status='analyzed', analysis=$2::jsonb, score=$3, level=$4, short_report=$5::jsonb,
-            cost_units=$6, updated_at=now()
-        WHERE call_id=$1
-        """,
-        call["id"], json.dumps(analysis, ensure_ascii=False), score, level,
-        json.dumps(short_report, ensure_ascii=False), cost,
-    )
-    log.info("call id=%s разобран: уровень=%s стоимость=%.0f ед.", call["id"], level, cost)
-
-    try:
-        await deliver_immediate(pool, client, call, short_report, level)
-    except Exception:
-        log.exception("ошибка немедленной доставки, call id=%s", call["id"])
 
 
 # -------------------------------------------------------------------- дайджест
@@ -625,8 +435,7 @@ async def maybe_send_digests(pool: asyncpg.Pool) -> None:
 
 async def main() -> None:
     pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=5)
-    await reset_orphaned(pool)
-    log.info("astra worker started (standalone)")
+    log.info("astra worker started (poll + enqueue only; разбор — в queue_runner)")
     last_sweep = 0.0
     next_poll_at: dict[int, float] = {}
     try:
@@ -637,16 +446,11 @@ async def main() -> None:
                 await sweep_timeouts(pool)
                 await maybe_send_digests(pool)
                 last_sweep = now
-            call = await claim_next(pool)
-            if call is None:
-                await asyncio.sleep(POLL_INTERVAL_SEC)
-                continue
-            await process_call(pool, call)
+            await asyncio.sleep(POLL_INTERVAL_SEC)
     finally:
         await pool.close()
         await bot.session.close()
         await mango_client.close()
-        await close_deepgram()
 
 
 if __name__ == "__main__":
