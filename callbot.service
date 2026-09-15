@@ -1,0 +1,16 @@
+[Unit]
+Description=Cold-call analysis Telegram bot (Astra)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=callbot-astra
+WorkingDirectory=/opt/callbot-astra
+EnvironmentFile=/opt/callbot-astra/.env
+ExecStart=/opt/callbot-astra/.venv/bin/python /opt/callbot-astra/demo_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
