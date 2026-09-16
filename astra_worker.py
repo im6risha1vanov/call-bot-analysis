@@ -4,16 +4,17 @@
 процессе — с Этапа 1 мультиагентной шины это обработчик очереди
 `analyze_call` (handlers/analyze_call.py), который забирает задачи через
 queue_runner.py. Здесь остаётся только: опрос Mango и постановка задач в
-очередь, heartbeat, sweep таймаутов записи, вечерний дайджест.
+очередь, sweep таймаутов записи, вечерний дайджест.
 
 Источник звонков — ОПРОС Mango (poll_client_calls), не вебхуки — push-вебхуки
 у Mango платные, базовый API (stats/calls/request + result) бесплатный и уже
 используется.
 
-Опрос — раз в client.mango_poll_interval_sec (900 сек = 15 минут). После
-каждого цикла опроса — heartbeat-сообщение РОПу в Telegram: воркер реально
-проверяет Mango, а не тихо стоит (см. историю с часовым поясом — опрос молчал
-сутками, ничего не показывая в логах как сломанное).
+Опрос — раз в client.mango_poll_interval_sec (сейчас 300 сек = 5 минут).
+Успешный опрос пишется только в лог; в Telegram уходят лишь сообщения об
+ошибках опроса, не чаще раза в час (см. историю с часовым поясом — опрос
+молчал сутками, ничего не показывая как сломанное, поэтому совсем без сигнала
+об ошибке оставлять нельзя).
 """
 
 import asyncio
@@ -108,7 +109,7 @@ async def _enqueue_analyze_call(pool: asyncpg.Pool, client_id: int, call_row_id:
 
 
 async def poll_client_calls(pool: asyncpg.Pool, client: asyncpg.Record) -> tuple[int, int]:
-    """Возвращает (найдено всего, пойдёт в разбор) — для heartbeat-сообщения."""
+    """Возвращает (найдено всего, пойдёт в разбор) — для лога."""
     tz = ZoneInfo(client["timezone"])
     now_utc = datetime.now(timezone.utc)
     now_msk = now_utc.astimezone(tz).replace(tzinfo=None)
@@ -184,29 +185,35 @@ async def poll_client_calls(pool: asyncpg.Pool, client: asyncpg.Record) -> tuple
     return len(calls), to_analyze
 
 
-async def _send_heartbeat(pool: asyncpg.Pool, client: asyncpg.Record, found: int, to_analyze: int,
-                           error: str | None) -> None:
-    """Подтверждение РОПу, что опрос реально прошёл — без этого поломка опроса
-    (как было с часовым поясом у Claude-стороны) молчит сутками, ничего не
-    показывая в чате. found — все записи от Mango за окно (включая входящие,
-    короткие и не по нужным добавочным); to_analyze — сколько из них реально
-    пойдут в разбор."""
+# Рутинный heartbeat («проверила Mango, новых записей нет») убран по просьбе
+# пользователя — при опросе раз в 5 минут это 12 сообщений в час ни о чём.
+# Сообщения об ОШИБКАХ опроса оставлены: именно ради них heartbeat и заводился
+# после истории с часовым поясом, когда опрос молча простоял сутки. Успешный
+# опрос виден в логе (journalctl -u callbot-astra-worker), а не в чате.
+ERROR_NOTICE_COOLDOWN_SEC = 3600
+_last_error_notice: dict[int, float] = {}
+
+
+async def _send_poll_error(pool: asyncpg.Pool, client: asyncpg.Record, error: str) -> None:
+    """Не чаще раза в час на клиента: при опросе каждые 5 минут устойчивая
+    поломка иначе завалила бы чат одинаковыми сообщениями."""
+    now = time.monotonic()
+    if now - _last_error_notice.get(client["id"], 0) < ERROR_NOTICE_COOLDOWN_SEC:
+        return
     head_id = await _head_chat_id(pool, client["id"])
     if not head_id:
         return
+    _last_error_notice[client["id"]] = now
     tz = ZoneInfo(client["timezone"])
     stamp = datetime.now(tz).strftime("%d.%m %H:%M")
-    if error:
-        text = f"⚠️ Astra: ошибка опроса Mango в {stamp} — {esc(error)[:300]}. Попробую в следующий раз."
-    elif found == 0:
-        text = f"🔄 Astra проверила Mango в {stamp} — новых записей нет."
-    else:
-        text = (f"🔄 Astra проверила Mango в {stamp} — найдено записей: {found}, "
-                f"из них пойдёт в разбор: {to_analyze} (остальное — входящие/короткие/не те добавочные).")
     try:
-        await bot.send_message(head_id, text)
+        await bot.send_message(
+            head_id,
+            f"⚠️ Astra: ошибка опроса Mango в {stamp} — {esc(error)[:300]}. "
+            f"Продолжаю попытки, следующее сообщение об этой проблеме — не раньше чем через час.",
+        )
     except Exception:
-        log.exception("не удалось отправить heartbeat РОПу")
+        log.exception("не удалось отправить сообщение об ошибке опроса РОПу")
 
 
 async def poll_all_clients(pool: asyncpg.Pool, next_poll_at: dict[int, float]) -> None:
@@ -218,10 +225,11 @@ async def poll_all_clients(pool: asyncpg.Pool, next_poll_at: dict[int, float]) -
         next_poll_at[client["id"]] = now + client["mango_poll_interval_sec"]
         try:
             found, to_analyze = await poll_client_calls(pool, client)
-            await _send_heartbeat(pool, client, found, to_analyze, None)
+            log.info("client id=%s опрос завершён: найдено=%s, в разбор=%s", client["id"], found, to_analyze)
+            _last_error_notice.pop(client["id"], None)
         except Exception as exc:
             log.exception("ошибка опроса Mango, client id=%s", client["id"])
-            await _send_heartbeat(pool, client, 0, 0, str(exc))
+            await _send_poll_error(pool, client, str(exc))
 
 
 # --------------------------------------------------------------- обслуживание
