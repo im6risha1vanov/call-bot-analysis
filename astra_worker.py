@@ -292,6 +292,41 @@ async def maybe_enqueue_rop_digest_for_client(pool: asyncpg.Pool, client: asyncp
         log.info("client id=%s поставлена задача rop_digest_%s", client["id"], kind)
 
 
+OVERSIGHT_TZ = os.getenv("OVERSIGHT_TZ", "Europe/Moscow")
+OVERSIGHT_AT = dtime(22, 0)
+
+
+async def maybe_enqueue_oversight_report(pool: asyncpg.Pool) -> None:
+    """Отчёт надзора системный, а не по клиенту — отсюда единственная строка
+    состояния и собственная таймзона, не клиентская."""
+    tz = ZoneInfo(OVERSIGHT_TZ)
+    now_local = datetime.now(tz)
+    target = datetime.combine(now_local.date(), OVERSIGHT_AT, tzinfo=tz)
+    if not (target <= now_local < target + timedelta(hours=ROP_DIGEST_GRACE_HOURS)):
+        return
+
+    state = await pool.fetchrow("SELECT * FROM oversight_state WHERE id=1")
+    if state and state["last_sent_date"] == now_local.date():
+        return
+
+    await pool.execute(
+        """
+        INSERT INTO tasks (type, input, dedup_key)
+        VALUES ('oversight_report', '{}'::jsonb, $1)
+        ON CONFLICT (type, dedup_key) DO NOTHING
+        """,
+        f"oversight:{now_local.date().isoformat()}",
+    )
+    await pool.execute(
+        """
+        INSERT INTO oversight_state (id, last_sent_date) VALUES (1, $1)
+        ON CONFLICT (id) DO UPDATE SET last_sent_date = EXCLUDED.last_sent_date
+        """,
+        now_local.date(),
+    )
+    log.info("поставлена задача oversight_report за %s", now_local.date())
+
+
 async def maybe_enqueue_rop_digests(pool: asyncpg.Pool) -> None:
     clients = await pool.fetch("SELECT * FROM clients WHERE processing_enabled = true")
     for client in clients:
@@ -507,6 +542,7 @@ async def main() -> None:
                 await sweep_timeouts(pool)
                 await maybe_send_digests(pool)
                 await maybe_enqueue_rop_digests(pool)
+                await maybe_enqueue_oversight_report(pool)
                 last_sweep = now
             await asyncio.sleep(POLL_INTERVAL_SEC)
     finally:

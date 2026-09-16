@@ -314,6 +314,35 @@ async def get_lead_diagnosis_signal(pool: asyncpg.Pool, actor: Actor, period: di
     }
 
 
+async def get_training_history(pool: asyncpg.Pool, actor: Actor, manager_extension: str | None = None,
+                                limit: int = 10) -> list[dict]:
+    """Видимость Этапа 4 (тренажёр) для агента РОПа: кто тренировался, по
+    какой теме/сценарию, с каким результатом. Оценка тренировки — той же
+    линейкой (score_call/compute_level), что и реальные звонки, поэтому level
+    здесь сравним с level в get_stats/find_calls."""
+    extension = _scope_extension(actor, manager_extension)
+    limit = min(int(limit), 50)
+    rows = await pool.fetch(
+        """
+        SELECT id, extension, scenario_kind, topic, status, level, score, turns_count, started_at, ended_at
+        FROM training_sessions
+        WHERE client_id = $1 AND ($2::text IS NULL OR extension = $2)
+        ORDER BY started_at DESC LIMIT $3
+        """,
+        actor.client_id, extension, limit,
+    )
+    return [
+        {
+            "session_id": r["id"], "manager_extension": r["extension"], "scenario": r["scenario_kind"],
+            "topic": r["topic"], "status": r["status"], "level": r["level"], "score": r["score"],
+            "turns": r["turns_count"],
+            "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+            "ended_at": r["ended_at"].isoformat() if r["ended_at"] else None,
+        }
+        for r in rows
+    ]
+
+
 # ------------------------------------------------------------- схемы для LLM
 
 _PERIOD_SCHEMA = {
@@ -418,6 +447,20 @@ TOOL_SCHEMAS = [
                 "manager_extension": {"type": ["string", "null"]},
             },
             "required": ["period"],
+        },
+    },
+    {
+        "name": "get_training_history",
+        "description": ("История тренировок в тренажёре возражений: кто тренировался, по какому сценарию/теме, "
+                         "с каким уровнем (той же линейкой ✅/❌/❌❌, что и реальные звонки) и был ли сдвиг. "
+                         "status='active' — тренировка ещё идёт, у неё пока нет level."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "manager_extension": {"type": ["string", "null"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            },
+            "required": [],
         },
     },
 ]

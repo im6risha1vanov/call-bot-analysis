@@ -126,6 +126,7 @@ _TOOL_FUNCS = {
     "get_criteria_breakdown": tools.get_criteria_breakdown,
     "get_successful_evidence": tools.get_successful_evidence,
     "get_lead_diagnosis_signal": tools.get_lead_diagnosis_signal,
+    "get_training_history": tools.get_training_history,
 }
 
 
