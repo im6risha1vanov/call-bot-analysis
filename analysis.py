@@ -151,10 +151,29 @@ def compute_score(scores: dict) -> tuple[int | None, list[dict]]:
     return score, rows
 
 
-# Критерии, чей провал (когда применим) сам по себе даёт ❌❌ — упущенная
-# встреча — не по вине клиента, а из-за конкретной, называемой ошибки.
-# Идентично Claude-стороне — иначе уровни между движками несравнимы.
-LEVEL_CRITICAL_CRITERIA = {"brush_off_handled", "no_early_pitch", "decision_influence"}
+# Правило вердикта — в конфигурации, а не в коде: набор ключевых критериев и
+# требуемое число провалов меняются через .env, логику для этого править не
+# нужно.
+#
+# Прежнее правило («хватает одного ключевого или одного упущенного сигнала»)
+# давало на реальных данных 86% ❌❌ и ноль ❌ — шкала из трёх уровней, где
+# средний недостижим, это шкала из двух. Причина: критерий «выяснено, кто
+# влияет на решение» проваливается в 90% звонков и в одиночку обваливал всё.
+# Пороги подобраны не на глаз, а пересчётом сохранённых разборов — см.
+# diagnose_verdicts.py.
+LEVEL_CRITICAL_CRITERIA = set(
+    (os.getenv("VERDICT_KEY_CRITERIA")
+     or "brush_off_handled,no_early_pitch,decision_influence").replace(" ", "").split(",")
+)
+
+# Сколько ключевых критериев должно быть провалено для ❌❌.
+VERDICT_MIN_FAILURES = int(os.getenv("VERDICT_MIN_FAILURES", "3"))
+
+# Сколько провалов достаточно, если вдобавок упущен сигнал (названное третье
+# лицо или согласие с проблемой, которые менеджер не отработал). Если задать
+# значение не меньше VERDICT_MIN_FAILURES — сигналы на вердикт влиять
+# перестанут.
+VERDICT_MIN_FAILURES_WITH_SIGNAL = int(os.getenv("VERDICT_MIN_FAILURES_WITH_SIGNAL", "2"))
 
 
 def compute_level(scores: dict, rows: list[dict]) -> str | None:
@@ -163,16 +182,17 @@ def compute_level(scores: dict, rows: list[dict]) -> str | None:
     if scores.get("meeting_booked") or scores.get("proposal_sent") or scores.get("decision_maker_contact"):
         return "✅"
     by_key = {r["key"]: r for r in rows}
-    critical_failed = any(
-        by_key[key]["applicable"] and not by_key[key]["passed"]
-        for key in LEVEL_CRITICAL_CRITERIA if key in by_key
+    failed = sum(
+        1 for key in LEVEL_CRITICAL_CRITERIA
+        if key in by_key and by_key[key]["applicable"] and not by_key[key]["passed"]
     )
     signals = scores.get("signals") or {}
     missed_signal = (
         any(not t.get("followed_up") for t in signals.get("third_parties") or [])
         or any(not a.get("followed_up") for a in signals.get("problem_agreements") or [])
     )
-    return "❌❌" if (critical_failed or missed_signal) else "❌"
+    double = failed >= VERDICT_MIN_FAILURES or (missed_signal and failed >= VERDICT_MIN_FAILURES_WITH_SIGNAL)
+    return "❌❌" if double else "❌"
 
 
 def build_brief(scores: dict, rows: list[dict]) -> str:
