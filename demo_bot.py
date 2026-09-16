@@ -7,7 +7,7 @@ import httpx
 import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 ROOT=Path(__file__).parent
@@ -20,9 +20,8 @@ from analysis import analyze, review_call
 # аплоад) — импорт под своими именами их бы тихо подменил
 from reports import detail_button, fmt_call_time, render_head as pg_render_head, render_manager as pg_render_manager
 import rop_agent
-import training_simulator
-import tts
-from deepgram_client import transcribe_bytes as dg_transcribe_bytes
+# training_simulator/tts/Deepgram-распознавание переехали в training_bot.py —
+# тренажёр живёт в отдельном боте, здесь они больше не нужны.
 from tools import resolve_actor
 
 BOT_TOKEN=os.environ['BOT_TOKEN']; DG_KEY=os.environ['DEEPGRAM_API_KEY']
@@ -294,67 +293,18 @@ async def stats_command(message):
     await send_chunks(message.bot,message.chat.id,text)
 
 # --------------------------------------------------------- тренажёр возражений
+# Сама тренировка живёт в отдельном боте (training_bot.py): в одном боте
+# голосовое означало бы две разные вещи — ход тренировки или запись реального
+# звонка на разбор. Здесь остаётся только назначение тренировки РОПом.
 
-async def _send_training_reply(reply_target, result: training_simulator.TurnResult) -> None:
-    """reply_target — Message или CallbackQuery.message: обоим достаточно
-    .bot/.chat.id/.answer(). Голос — основной путь; текст — откат, если TTS
-    ещё не настроен (см. tts.py) или синтез не удался."""
-    try:
-        ogg_bytes, _cost = await tts.synthesize_ogg(result.reply_text)
-        await reply_target.bot.send_voice(reply_target.chat.id, voice=BufferedInputFile(ogg_bytes, filename='client.ogg'))
-    except tts.TTSNotConfigured:
-        await reply_target.answer(html.escape(result.reply_text))
-    except Exception:
-        log.exception('ошибка синтеза речи тренажёра')
-        await reply_target.answer(html.escape(result.reply_text))
-
-
-async def _process_training_turn(reply_target, session, manager_text: str) -> None:
-    try:
-        result = await training_simulator.handle_manager_turn(PG_POOL, session, manager_text)
-    except Exception:
-        log.exception('ошибка хода тренажёра, session id=%s', session['id'])
-        await reply_target.answer('Не удалось обработать ответ, попробуйте ещё раз.')
-        return
-    await _send_training_reply(reply_target, result)
-    if result.ended:
-        level_line = f' Уровень: {result.level}.' if result.level else ''
-        await reply_target.answer(f'Тренировка завершена.{level_line} Подробности доступны агенту РОПа.')
-
-
-async def _launch_training(reply_target, actor, topic: str | None, assigned_by: str | None) -> None:
-    existing = await training_simulator.get_active_session(PG_POOL, actor)
-    if existing is not None:
-        await reply_target.answer('У вас уже есть незавершённая тренировка — закончите её, прежде чем начинать новую.')
-        return
-    client = await PG_POOL.fetchrow('SELECT timezone FROM clients WHERE id=$1', actor.client_id)
-    tz_name = client['timezone'] if client else 'Europe/Moscow'
-    done_today = await training_simulator.sessions_today(PG_POOL, actor.client_id, actor.extension, tz_name)
-    if done_today >= training_simulator.MAX_SESSIONS_PER_DAY:
-        await reply_target.answer(
-            f'Уже {done_today} тренировки сегодня — дневной лимит ({training_simulator.MAX_SESSIONS_PER_DAY}) исчерпан.')
-        return
-    session = await training_simulator.start_session(PG_POOL, actor, topic, assigned_by)
-    opening = json.loads(session['transcript'])[0]['text']
-    await reply_target.answer('Тренировка началась — отвечайте голосовыми сообщениями (или текстом).')
-    await _send_training_reply(reply_target, training_simulator.TurnResult(opening, False))
-
-
-@router.message(Command('train'))
-async def train_command(message: Message):
-    if PG_POOL is None:
-        return
-    actor = await resolve_actor(PG_POOL, message.from_user.id)
-    if actor is None or actor.role != 'manager':
-        await message.answer('Команда доступна только менеджерам.')
-        return
-    await _launch_training(message, actor, topic=None, assigned_by=None)
+TRAIN_BOT_USERNAME = os.getenv('TRAIN_BOT_USERNAME', '').strip().lstrip('@')
 
 
 @router.message(Command('assign_train'))
 async def assign_train_command(message: Message):
-    """Только РОП. Менеджеру уходит уведомление с кнопкой — сама тренировка
-    начинается по нажатию (train_start_callback), а не сразу здесь."""
+    """Только РОП. Менеджеру уходит ссылка на бота-тренажёра: одно нажатие и
+    запускает того бота (иначе Telegram не даст ему написать первым), и
+    стартует назначенную тренировку."""
     if PG_POOL is None:
         return
     actor = await resolve_actor(PG_POOL, message.from_user.id)
@@ -381,39 +331,23 @@ async def assign_train_command(message: Message):
            VALUES ($1,$2,$3,$4) RETURNING id""",
         actor.client_id, extension, topic, actor.telegram_user_id,
     )
+    if not TRAIN_BOT_USERNAME:
+        await message.answer('Не задан TRAIN_BOT_USERNAME в .env — ссылку на тренажёр не собрать.')
+        return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='Начать тренировку', callback_data=f'train_start:{assignment_id}')
+        InlineKeyboardButton(text='Начать тренировку',
+                              url=f'https://t.me/{TRAIN_BOT_USERNAME}?start=train_{assignment_id}')
     ]])
     topic_line = f' по теме «{html.escape(topic)}»' if topic else ''
     try:
-        await message.bot.send_message(manager['telegram_user_id'], f'РОП назначил вам тренировку{topic_line}.', reply_markup=kb)
+        await message.bot.send_message(manager['telegram_user_id'],
+                                        f'РОП назначил вам тренировку{topic_line}. Она пройдёт в боте-тренажёре.',
+                                        reply_markup=kb)
     except Exception:
         log.exception('не удалось отправить уведомление о тренировке, доб.=%s', extension)
         await message.answer('Не удалось отправить уведомление менеджеру (возможно, он не запускал бота).')
         return
-    await message.answer(f'Назначено, доб. {html.escape(extension)} получит уведомление.')
-
-
-@router.callback_query(F.data.startswith('train_start:'))
-async def train_start_callback(cq: CallbackQuery):
-    if PG_POOL is None:
-        await cq.answer(); return
-    actor = await resolve_actor(PG_POOL, cq.from_user.id)
-    if actor is None or actor.role != 'manager':
-        await cq.answer('Недоступно.', show_alert=True); return
-    try:
-        assignment_id = int(cq.data.rsplit(':', 1)[1])
-    except (ValueError, IndexError):
-        await cq.answer('Некорректные данные.', show_alert=True); return
-    assignment = await PG_POOL.fetchrow(
-        'SELECT * FROM pending_train_assignments WHERE id=$1 AND consumed=false', assignment_id
-    )
-    if not assignment or assignment['extension'] != actor.extension or assignment['client_id'] != actor.client_id:
-        await cq.answer('Это назначение не для вас или уже использовано.', show_alert=True); return
-    await PG_POOL.execute('UPDATE pending_train_assignments SET consumed=true WHERE id=$1', assignment_id)
-    await cq.answer()
-    await _launch_training(cq.message, actor, topic=assignment['topic'],
-                            assigned_by=str(assignment['assigned_by_telegram_user_id']))
+    await message.answer(f'Назначено, доб. {html.escape(extension)} получит ссылку на тренажёр.')
 
 
 # --------------------------------------------------- очередь на подтверждение
@@ -500,21 +434,15 @@ async def reject_callback(cq: CallbackQuery):
 
 @router.message(F.text)
 async def rop_question(message: Message):
-    """Свободный вопрос агенту РОПа (Этап 3) — или, если у отправителя активна
-    тренировка (Этап 4), текстовый ход тренажёра (запасной путь на случай
-    голоса). Регистрируется после команд — aiogram отдаёт сообщение сюда,
-    только если ни один Command()/CommandStart() фильтр выше не совпал.
-    Actor резолвится по telegram_user_id из employees; если человек не
-    сотрудник ни одного клиента — молчим, а не отвечаем как попало."""
+    """Свободный вопрос агенту РОПа (Этап 3). Регистрируется после команд —
+    aiogram отдаёт сообщение сюда, только если ни один Command()/CommandStart()
+    фильтр выше не совпал. Actor резолвится по telegram_user_id из employees;
+    если человек не сотрудник ни одного клиента — молчим, а не отвечаем как
+    попало."""
     if PG_POOL is None:
         return
     actor = await resolve_actor(PG_POOL, message.from_user.id)
     if actor is None:
-        return
-
-    session = await training_simulator.get_active_session(PG_POOL, actor)
-    if session is not None:
-        await _process_training_turn(message, session, message.text or '')
         return
 
     status = await message.answer('Секунду, смотрю данные…')
@@ -539,22 +467,8 @@ def media_from(message):
 
 @router.message(F.voice|F.audio|F.document)
 async def audio_message(message):
-    if message.voice is not None and PG_POOL is not None:
-        actor = await resolve_actor(PG_POOL, message.from_user.id)
-        if actor is not None:
-            session = await training_simulator.get_active_session(PG_POOL, actor)
-            if session is not None:
-                try:
-                    file = await message.bot.get_file(message.voice.file_id)
-                    buf = await message.bot.download_file(file.file_path)
-                    raw_transcript, _dur = await dg_transcribe_bytes(buf.read())
-                    manager_text = training_simulator.strip_speaker_tags(raw_transcript) or '(не удалось распознать речь)'
-                except Exception:
-                    log.exception('ошибка распознавания голосового сообщения тренажёра, session id=%s', session['id'])
-                    await message.answer('Не удалось распознать голосовое сообщение, попробуйте ещё раз.')
-                    return
-                await _process_training_turn(message, session, manager_text)
-                return
+    # Голосовое здесь всегда означает запись звонка на разбор: тренировка
+    # переехала в отдельного бота, и двусмысленности больше нет.
     media=media_from(message)
     if not media: await message.answer('Документ должен быть аудиофайлом.'); return
     file_id,size,name=media

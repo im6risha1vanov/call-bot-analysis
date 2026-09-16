@@ -1,0 +1,210 @@
+"""
+Отдельный Telegram-бот тренажёра возражений (Этап 4).
+
+Почему отдельный бот, а не команда в основном: в одном боте голосовое
+сообщение означало две разные вещи — ход тренировки, если у менеджера есть
+активная сессия, и запись реального звонка на разбор, если нет. Менеджер с
+открытой тренировкой не мог загрузить настоящий звонок, а посреди ролевой
+игры в тот же чат прилетал ❌❌-отчёт и ломал её. Здесь разведение по ботам:
+этот чат — клиент, тот чат — аналитик.
+
+Сама логика тренировки живёт в training_simulator.py и от Telegram не
+зависит; здесь только слой бота.
+
+Личность менеджера определяется по telegram_user_id — он в Telegram общий для
+всех ботов, поэтому повторно привязывать добавочный через /invite не нужно.
+Но написать боту первым менеджер обязан (правило Telegram) — для назначенных
+РОПом тренировок это решает диплинк из основного бота.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import logging
+import os
+from pathlib import Path
+
+import asyncpg
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import BufferedInputFile, Message
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).parent
+load_dotenv(ROOT / '.env')
+logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'), format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger('callbot-trainer')
+
+import tts  # noqa: E402  — читает переменные окружения при импорте, только после load_dotenv
+import training_simulator  # noqa: E402
+from deepgram_client import transcribe_bytes as dg_transcribe_bytes  # noqa: E402
+from tools import resolve_actor  # noqa: E402
+
+BOT_TOKEN = os.environ['TRAIN_BOT_TOKEN']
+
+router = Router()
+PG_POOL: asyncpg.Pool | None = None
+
+START_TEXT = (
+    'Это тренажёр возражений. Я играю клиента, которому вы звоните вхолодную — '
+    'занятого и не настроенного разговаривать.\n\n'
+    'Команда /train начинает тренировку. Отвечать можно голосовыми сообщениями '
+    '(как в реальном звонке) или текстом.\n\n'
+    'Разбор реальных звонков и вопросы по статистике — в основном боте, здесь только тренировка.'
+)
+
+
+async def _send_training_reply(message: Message, result: training_simulator.TurnResult) -> None:
+    """Голос — основной путь; текст — откат, если TTS ещё не настроен
+    (см. tts.py) или синтез не удался."""
+    try:
+        ogg_bytes, _cost = await tts.synthesize_ogg(result.reply_text)
+        await message.bot.send_voice(message.chat.id, voice=BufferedInputFile(ogg_bytes, filename='client.ogg'))
+    except tts.TTSNotConfigured:
+        await message.answer(html.escape(result.reply_text))
+    except Exception:
+        log.exception('ошибка синтеза речи тренажёра')
+        await message.answer(html.escape(result.reply_text))
+
+
+async def _process_turn(message: Message, session, manager_text: str) -> None:
+    try:
+        result = await training_simulator.handle_manager_turn(PG_POOL, session, manager_text)
+    except Exception:
+        log.exception('ошибка хода тренажёра, session id=%s', session['id'])
+        await message.answer('Не удалось обработать ответ, попробуйте ещё раз.')
+        return
+    await _send_training_reply(message, result)
+    if result.ended:
+        level_line = f' Уровень: {result.level}.' if result.level else ''
+        await message.answer(f'Тренировка завершена.{level_line} Подробности доступны агенту РОПа.')
+
+
+async def _launch(message: Message, actor, topic: str | None, assigned_by: str | None) -> None:
+    existing = await training_simulator.get_active_session(PG_POOL, actor)
+    if existing is not None:
+        await message.answer('У вас уже есть незавершённая тренировка — закончите её, прежде чем начинать новую.')
+        return
+    client = await PG_POOL.fetchrow('SELECT timezone FROM clients WHERE id=$1', actor.client_id)
+    tz_name = client['timezone'] if client else 'Europe/Moscow'
+    done_today = await training_simulator.sessions_today(PG_POOL, actor.client_id, actor.extension, tz_name)
+    if done_today >= training_simulator.MAX_SESSIONS_PER_DAY:
+        await message.answer(
+            f'Уже {done_today} тренировки сегодня — дневной лимит ({training_simulator.MAX_SESSIONS_PER_DAY}) исчерпан.')
+        return
+    session = await training_simulator.start_session(PG_POOL, actor, topic, assigned_by)
+    opening = json.loads(session['transcript'])[0]['text']
+    await message.answer('Тренировка началась — отвечайте голосовыми сообщениями (или текстом).')
+    await _send_training_reply(message, training_simulator.TurnResult(opening, False))
+
+
+async def _require_manager(message: Message):
+    if PG_POOL is None:
+        return None
+    actor = await resolve_actor(PG_POOL, message.from_user.id)
+    if actor is None:
+        await message.answer('Вы не привязаны к системе. Попросите РОПа прислать ссылку /invite в основном боте.')
+        return None
+    if actor.role != 'manager':
+        await message.answer('Тренажёр предназначен для менеджеров.')
+        return None
+    return actor
+
+
+@router.message(CommandStart())
+async def start_command(message: Message, command: CommandObject):
+    """Диплинк вида ?start=train_<id> приходит сюда из основного бота, когда
+    РОП назначает тренировку: одно нажатие и запускает бота (Telegram иначе не
+    даст ему написать первым), и стартует назначенную сессию."""
+    payload = (command.args or '').strip()
+    if not payload.startswith('train_'):
+        await message.answer(START_TEXT)
+        return
+
+    actor = await _require_manager(message)
+    if actor is None:
+        return
+    try:
+        assignment_id = int(payload.removeprefix('train_'))
+    except ValueError:
+        await message.answer(START_TEXT)
+        return
+
+    assignment = await PG_POOL.fetchrow(
+        'SELECT * FROM pending_train_assignments WHERE id=$1 AND consumed=false', assignment_id
+    )
+    if not assignment or assignment['extension'] != actor.extension or assignment['client_id'] != actor.client_id:
+        await message.answer('Это назначение не для вас или уже использовано. Начать обычную тренировку: /train')
+        return
+    await PG_POOL.execute('UPDATE pending_train_assignments SET consumed=true WHERE id=$1', assignment_id)
+    await _launch(message, actor, topic=assignment['topic'],
+                  assigned_by=str(assignment['assigned_by_telegram_user_id']))
+
+
+@router.message(Command('help'))
+async def help_command(message: Message):
+    await message.answer(START_TEXT)
+
+
+@router.message(Command('train'))
+async def train_command(message: Message):
+    actor = await _require_manager(message)
+    if actor is None:
+        return
+    await _launch(message, actor, topic=None, assigned_by=None)
+
+
+@router.message(F.voice)
+async def voice_turn(message: Message):
+    """Распознаём тем же Deepgram, что и реальные звонки — тренировка и работа
+    проходят через один движок, а не через премиум-расшифровку Telegram,
+    которой у ботов всё равно нет."""
+    actor = await _require_manager(message)
+    if actor is None:
+        return
+    session = await training_simulator.get_active_session(PG_POOL, actor)
+    if session is None:
+        await message.answer('Нет активной тренировки. Начать: /train')
+        return
+    try:
+        file = await message.bot.get_file(message.voice.file_id)
+        buf = await message.bot.download_file(file.file_path)
+        raw_transcript, _dur = await dg_transcribe_bytes(buf.read())
+        manager_text = training_simulator.strip_speaker_tags(raw_transcript) or '(не удалось распознать речь)'
+    except Exception:
+        log.exception('ошибка распознавания голосового сообщения, session id=%s', session['id'])
+        await message.answer('Не удалось распознать голосовое сообщение, попробуйте ещё раз.')
+        return
+    await _process_turn(message, session, manager_text)
+
+
+@router.message(F.text)
+async def text_turn(message: Message):
+    actor = await _require_manager(message)
+    if actor is None:
+        return
+    session = await training_simulator.get_active_session(PG_POOL, actor)
+    if session is None:
+        await message.answer('Нет активной тренировки. Начать: /train')
+        return
+    await _process_turn(message, session, message.text or '')
+
+
+async def main() -> None:
+    global PG_POOL
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    PG_POOL = await asyncpg.create_pool(os.environ['DATABASE_URL'], min_size=1, max_size=3)
+    log.info('training bot started')
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await bot.session.close()
+        await PG_POOL.close()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
