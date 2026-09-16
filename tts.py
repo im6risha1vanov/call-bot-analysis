@@ -57,21 +57,27 @@ async def close() -> None:
 
 async def _yandex_synthesize(text: str) -> bytes:
     api_key = os.getenv("YANDEX_TTS_API_KEY", "").strip()
-    folder_id = os.getenv("YANDEX_TTS_FOLDER_ID", "").strip()
-    if not api_key or not folder_id:
-        raise TTSNotConfigured("TTS_PROVIDER=yandex, но YANDEX_TTS_API_KEY/YANDEX_TTS_FOLDER_ID не заданы")
+    if not api_key:
+        raise TTSNotConfigured("TTS_PROVIDER=yandex, но YANDEX_TTS_API_KEY не задан")
 
     voice = os.getenv("YANDEX_TTS_VOICE", "filipp").strip()
+    data = {
+        "text": text,
+        "lang": "ru-RU",
+        "voice": voice,
+        "format": "oggopus",  # нативный формат Telegram voice — без ffmpeg
+    }
+    # Каталог указывать не нужно: ключ сервисного аккаунта уже привязан к нему
+    # (проверено на боевом ключе). Переменная оставлена на случай ключа от
+    # пользовательского аккаунта, где folderId обязателен.
+    folder_id = os.getenv("YANDEX_TTS_FOLDER_ID", "").strip()
+    if folder_id:
+        data["folderId"] = folder_id
+
     r = await _http().post(
         YANDEX_TTS_URL,
         headers={"Authorization": f"Api-Key {api_key}"},
-        data={
-            "text": text,
-            "lang": "ru-RU",
-            "voice": voice,
-            "format": "oggopus",  # нативный формат Telegram voice — без ffmpeg
-            "folderId": folder_id,
-        },
+        data=data,
     )
     if r.status_code != 200:
         # Не raise_for_status(): тело ответа Яндекса содержит причину отказа

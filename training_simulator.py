@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -263,10 +264,14 @@ async def start_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
 
 
 class TurnResult:
-    def __init__(self, reply_text: str, ended: bool, level: str | None = None):
-        self.reply_text = reply_text
+    def __init__(self, reply_text: str, ended: bool, level: str | None = None, note: str | None = None):
+        self.reply_text = reply_text  # реплика клиента — её озвучиваем
         self.ended = ended
         self.level = level
+        # Служебный комментарий (разбор предыдущего ответа в режиме отработки).
+        # Отправляется текстом, а не голосом: иначе «клиент» посреди звонка
+        # начал бы вслух оценивать работу менеджера.
+        self.note = note
 
 
 async def handle_manager_turn(pool: asyncpg.Pool, session: asyncpg.Record, manager_text: str) -> TurnResult:
@@ -318,6 +323,158 @@ async def handle_manager_turn(pool: asyncpg.Pool, session: asyncpg.Record, manag
         level = await _finalize(pool, session["id"], transcript)
 
     return TurnResult(reply, ended, level)
+
+
+# ------------------------------------------- режим 2: отработка возражений
+#
+# Отличается от разговора тем, что связного звонка нет: одно возражение — один
+# ответ — короткий разбор — следующее возражение. Нужен, когда менеджеру надо
+# набить руку именно на отговорках, а не проходить весь звонок целиком. Какой
+# из двух режимов назначить, решает РОП.
+
+DRILL_SIZE = 5
+
+OBJECTIONS = [
+    "Нам ничего не нужно, спасибо.",
+    "Отправьте всё на почту, я посмотрю.",
+    "Мы уже работаем с другими, нас всё устраивает.",
+    "У меня нет времени сейчас разговаривать.",
+    "Это дорого для нас.",
+    "Я не занимаюсь этим вопросом.",
+    "Перезвоните через месяц, сейчас не до этого.",
+    "А откуда у вас мои контакты?",
+    "Нам это неинтересно.",
+    "Пришлите коммерческое, если заинтересует — сами позвоним.",
+]
+
+# Формулировка критерия — дословно из prompt_score.md: тренировка меряется той
+# же линейкой, что и реальные звонки, иначе прогресс не с чем сравнивать.
+DRILL_CRITERION = """**brush_off_handled** — отговорка пройдена.
+Правильно: зацепиться за сказанное клиентом, задать уточняющий вопрос и на
+основании ответа вернуть разговор к встрече. Не засчитывается, если менеджер
+спорил по существу, повторил презентацию или согласился и свернул разговор.
+Согласие с «отправьте на почту» — не пройден."""
+
+DRILL_JUDGE_PROMPT = f"""Ты оцениваешь один ответ менеджера на одну отговорку клиента в тренажёре
+холодных звонков. Критерий — тот же, что применяется к реальным звонкам:
+
+{DRILL_CRITERION}
+
+Верни строго JSON без пояснений вокруг:
+{{"passed": true|false, "comment": "одна фраза"}}
+
+comment — не длиннее 20 слов, конкретно про этот ответ: что именно сработало или
+чего не хватило. Без общих советов вроде «поработайте над возражениями»."""
+
+
+async def start_drill_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
+                               assigned_by: str | None) -> asyncpg.Record:
+    """Лимиты (активная сессия, штук в день) проверяет вызывающий код — как и
+    для режима разговора."""
+    objections = random.sample(OBJECTIONS, min(DRILL_SIZE, len(OBJECTIONS)))
+    drill_state = {"objections": objections, "results": []}
+
+    row = await pool.fetchrow(
+        """
+        INSERT INTO training_sessions (client_id, extension, assigned_by, topic, scenario_kind,
+                                        mode, transcript, drill_state, turns_count, cost_usd)
+        VALUES ($1, $2, $3, $4, 'brush_off_handled', 'drill', $5::jsonb, $6::jsonb, 1, 0)
+        RETURNING *
+        """,
+        actor.client_id, actor.extension, assigned_by, topic,
+        json.dumps([{"role": "client", "text": objections[0]}], ensure_ascii=False),
+        json.dumps(drill_state, ensure_ascii=False),
+    )
+    log.info("drill session id=%s начата, доб.=%s возражений=%s",
+             row["id"], actor.extension, len(objections))
+    return row
+
+
+async def _judge_answer(objection: str, answer: str) -> tuple[bool, str, float]:
+    resp = await claude.messages.create(
+        model=MODEL, max_tokens=200, thinking={"type": "disabled"},
+        system=[{"type": "text", "text": DRILL_JUDGE_PROMPT, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": f"Отговорка клиента: «{objection}»\nОтвет менеджера: «{answer}»"}],
+    )
+    cost = _cost_of(resp.usage)
+    raw = "".join(b.text for b in resp.content if b.type == "text").strip()
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        verdict = json.loads(raw)
+        return bool(verdict.get("passed")), str(verdict.get("comment") or "").strip(), cost
+    except json.JSONDecodeError:
+        # Не роняем тренировку из-за формата ответа модели: засчитываем как
+        # непройденное и говорим прямо, что разбор не получился.
+        log.warning("не разобрал ответ судьи тренажёра: %s", raw[:200])
+        return False, "не удалось разобрать оценку", cost
+
+
+async def handle_drill_turn(pool: asyncpg.Pool, session: asyncpg.Record, manager_text: str) -> TurnResult:
+    drill_state = json.loads(session["drill_state"])
+    objections: list[str] = drill_state["objections"]
+    results: list[dict] = drill_state["results"]
+
+    current = objections[len(results)]
+    passed, comment, call_cost = await _judge_answer(current, manager_text)
+    results.append({"objection": current, "answer": manager_text, "passed": passed, "comment": comment})
+
+    transcript: list[dict] = json.loads(session["transcript"])
+    transcript.append({"role": "manager", "text": manager_text})
+    cost = float(session["cost_usd"]) + call_cost
+    turns_count = session["turns_count"] + 1
+
+    mark = "✅ зачтено" if passed else "❌ не зачтено"
+    note = f"{mark}. {comment}" if comment else mark
+
+    elapsed = datetime.now(ZoneInfo("UTC")) - session["started_at"]
+    out_of_room = (
+        len(results) >= len(objections)
+        or elapsed >= timedelta(minutes=MAX_MINUTES)
+        or cost >= SESSION_BUDGET_USD
+    )
+
+    if out_of_room:
+        drill_state["results"] = results
+        await pool.execute(
+            """UPDATE training_sessions SET transcript=$2::jsonb, drill_state=$3::jsonb,
+               turns_count=$4, cost_usd=$5, updated_at=now() WHERE id=$1""",
+            session["id"], json.dumps(transcript, ensure_ascii=False),
+            json.dumps(drill_state, ensure_ascii=False), turns_count, cost,
+        )
+        summary = await _finalize_drill(pool, session["id"], drill_state)
+        return TurnResult(summary, True, None, note=note)
+
+    next_objection = objections[len(results)]
+    transcript.append({"role": "client", "text": next_objection})
+    turns_count += 1
+    drill_state["results"] = results
+    await pool.execute(
+        """UPDATE training_sessions SET transcript=$2::jsonb, drill_state=$3::jsonb,
+           turns_count=$4, cost_usd=$5, updated_at=now() WHERE id=$1""",
+        session["id"], json.dumps(transcript, ensure_ascii=False),
+        json.dumps(drill_state, ensure_ascii=False), turns_count, cost,
+    )
+    return TurnResult(next_objection, False, None, note=note)
+
+
+async def _finalize_drill(pool: asyncpg.Pool, session_id: int, drill_state: dict) -> str:
+    results = drill_state["results"]
+    passed = sum(1 for r in results if r["passed"])
+    score = round(passed / len(results) * 100) if results else None
+    analysis = {"mode": "drill", "results": results}
+    await pool.execute(
+        """UPDATE training_sessions SET status='completed', ended_at=now(), score=$2,
+           analysis=$3::jsonb, drill_state=$4::jsonb, updated_at=now() WHERE id=$1""",
+        session_id, score, json.dumps(analysis, ensure_ascii=False),
+        json.dumps(drill_state, ensure_ascii=False),
+    )
+    log.info("drill session id=%s завершена: зачтено %s из %s", session_id, passed, len(results))
+
+    weak = [r["objection"] for r in results if not r["passed"]]
+    tail = ""
+    if weak:
+        tail = " Не зачтены: " + "; ".join(f"«{o}»" for o in weak[:3])
+    return f"Отработка закончена: зачтено {passed} из {len(results)}.{tail}"
 
 
 def _build_fake_transcript(transcript: list[dict]) -> str:

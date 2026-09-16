@@ -85,6 +85,19 @@ def _weak_point(short_report_json) -> str | None:
     return weak.get("text") if weak else None
 
 
+def _drill_summary(drill_state_json) -> dict | None:
+    """Сводка по отработке возражений: сколько зачтено и какие именно не
+    зачтены — агенту РОПа этого хватает, полные ответы менеджера ему не нужны."""
+    if not drill_state_json:
+        return None
+    results = (json.loads(drill_state_json) or {}).get("results") or []
+    return {
+        "passed": sum(1 for r in results if r.get("passed")),
+        "total": len(results),
+        "failed_objections": [r["objection"] for r in results if not r.get("passed")],
+    }
+
+
 def _level_counts(rows) -> dict[str, int]:
     counts = {"✅": 0, "❌": 0, "❌❌": 0}
     for r in rows:
@@ -324,7 +337,8 @@ async def get_training_history(pool: asyncpg.Pool, actor: Actor, manager_extensi
     limit = min(int(limit), 50)
     rows = await pool.fetch(
         """
-        SELECT id, extension, scenario_kind, topic, status, level, score, turns_count, started_at, ended_at
+        SELECT id, extension, scenario_kind, topic, status, level, score, turns_count,
+               mode, drill_state, started_at, ended_at
         FROM training_sessions
         WHERE client_id = $1 AND ($2::text IS NULL OR extension = $2)
         ORDER BY started_at DESC LIMIT $3
@@ -336,6 +350,11 @@ async def get_training_history(pool: asyncpg.Pool, actor: Actor, manager_extensi
             "session_id": r["id"], "manager_extension": r["extension"], "scenario": r["scenario_kind"],
             "topic": r["topic"], "status": r["status"], "level": r["level"], "score": r["score"],
             "turns": r["turns_count"],
+            # dialog — разговор целиком, оценён теми же критериями, что и реальные
+            # звонки (level сравним с get_stats). drill — отработка возражений
+            # поштучно: level не ставится, score — доля зачтённых ответов.
+            "mode": r["mode"],
+            "objections_handled": _drill_summary(r["drill_state"]) if r["mode"] == "drill" else None,
             "started_at": r["started_at"].isoformat() if r["started_at"] else None,
             "ended_at": r["ended_at"].isoformat() if r["ended_at"] else None,
         }

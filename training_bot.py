@@ -29,7 +29,8 @@ from pathlib import Path
 import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,
+                            InlineKeyboardMarkup, Message)
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).parent
@@ -58,7 +59,14 @@ START_TEXT = (
 
 async def _send_training_reply(message: Message, result: training_simulator.TurnResult) -> None:
     """Голос — основной путь; текст — откат, если TTS ещё не настроен
-    (см. tts.py) или синтез не удался."""
+    (см. tts.py) или синтез не удался.
+
+    result.note (разбор предыдущего ответа в режиме отработки) уходит текстом
+    отдельно: это голос тренера, а не клиента, озвучивать его нельзя."""
+    if result.note:
+        await message.answer(html.escape(result.note))
+    if not result.reply_text:
+        return
     try:
         ogg_bytes, _cost = await tts.synthesize_ogg(result.reply_text)
         await message.bot.send_voice(message.chat.id, voice=BufferedInputFile(ogg_bytes, filename='client.ogg'))
@@ -70,8 +78,10 @@ async def _send_training_reply(message: Message, result: training_simulator.Turn
 
 
 async def _process_turn(message: Message, session, manager_text: str) -> None:
+    handler = (training_simulator.handle_drill_turn if session['mode'] == 'drill'
+               else training_simulator.handle_manager_turn)
     try:
-        result = await training_simulator.handle_manager_turn(PG_POOL, session, manager_text)
+        result = await handler(PG_POOL, session, manager_text)
     except Exception:
         log.exception('ошибка хода тренажёра, session id=%s', session['id'])
         await message.answer('Не удалось обработать ответ, попробуйте ещё раз.')
@@ -82,7 +92,17 @@ async def _process_turn(message: Message, session, manager_text: str) -> None:
         await message.answer(f'Тренировка завершена.{level_line} Подробности доступны агенту РОПа.')
 
 
-async def _launch(message: Message, actor, topic: str | None, assigned_by: str | None) -> None:
+INTRO = {
+    'dialog': ('Тренировка началась: обычный холодный звонок, клиент не настроен разговаривать. '
+               'Отвечайте голосовыми сообщениями (или текстом).'),
+    'drill': (f'Отработка возражений: {training_simulator.DRILL_SIZE} штук подряд. На каждое отвечайте так, '
+              'как ответили бы в реальном звонке — голосовым или текстом. После каждого ответа '
+              'скажу, зачтено или нет.'),
+}
+
+
+async def _launch(message: Message, actor, topic: str | None, assigned_by: str | None,
+                   mode: str = 'dialog') -> None:
     existing = await training_simulator.get_active_session(PG_POOL, actor)
     if existing is not None:
         await message.answer('У вас уже есть незавершённая тренировка — закончите её, прежде чем начинать новую.')
@@ -94,9 +114,12 @@ async def _launch(message: Message, actor, topic: str | None, assigned_by: str |
         await message.answer(
             f'Уже {done_today} тренировки сегодня — дневной лимит ({training_simulator.MAX_SESSIONS_PER_DAY}) исчерпан.')
         return
-    session = await training_simulator.start_session(PG_POOL, actor, topic, assigned_by)
+    if mode == 'drill':
+        session = await training_simulator.start_drill_session(PG_POOL, actor, topic, assigned_by)
+    else:
+        session = await training_simulator.start_session(PG_POOL, actor, topic, assigned_by)
     opening = json.loads(session['transcript'])[0]['text']
-    await message.answer('Тренировка началась — отвечайте голосовыми сообщениями (или текстом).')
+    await message.answer(INTRO[mode])
     await _send_training_reply(message, training_simulator.TurnResult(opening, False))
 
 
@@ -140,7 +163,8 @@ async def start_command(message: Message, command: CommandObject):
         return
     await PG_POOL.execute('UPDATE pending_train_assignments SET consumed=true WHERE id=$1', assignment_id)
     await _launch(message, actor, topic=assignment['topic'],
-                  assigned_by=str(assignment['assigned_by_telegram_user_id']))
+                  assigned_by=str(assignment['assigned_by_telegram_user_id']),
+                  mode=assignment['mode'])
 
 
 @router.message(Command('help'))
@@ -148,12 +172,48 @@ async def help_command(message: Message):
     await message.answer(START_TEXT)
 
 
+def _mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Разговор целиком', callback_data='train_mode:dialog')],
+        [InlineKeyboardButton(text='Отработка возражений', callback_data='train_mode:drill')],
+    ])
+
+
 @router.message(Command('train'))
 async def train_command(message: Message):
+    """Режим можно задать сразу (/train возражения), иначе спрашиваем кнопками —
+    менеджеру не нужно помнить синтаксис."""
     actor = await _require_manager(message)
     if actor is None:
         return
-    await _launch(message, actor, topic=None, assigned_by=None)
+    arg = (message.text or '').partition(' ')[2].strip().lower()
+    if arg in ('drill', 'возражения', 'отработка'):
+        await _launch(message, actor, topic=None, assigned_by=None, mode='drill')
+    elif arg in ('dialog', 'разговор', 'звонок'):
+        await _launch(message, actor, topic=None, assigned_by=None, mode='dialog')
+    else:
+        await message.answer('Что тренируем?', reply_markup=_mode_keyboard())
+
+
+@router.callback_query(F.data.startswith('train_mode:'))
+async def train_mode_callback(cq: CallbackQuery):
+    if PG_POOL is None:
+        await cq.answer()
+        return
+    actor = await resolve_actor(PG_POOL, cq.from_user.id)
+    if actor is None or actor.role != 'manager':
+        await cq.answer('Тренажёр предназначен для менеджеров.', show_alert=True)
+        return
+    mode = cq.data.rsplit(':', 1)[1]
+    if mode not in ('dialog', 'drill'):
+        await cq.answer('Неизвестный режим.', show_alert=True)
+        return
+    await cq.answer()
+    try:
+        await cq.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _launch(cq.message, actor, topic=None, assigned_by=None, mode=mode)
 
 
 @router.message(F.voice)

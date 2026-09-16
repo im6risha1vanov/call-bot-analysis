@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio, difflib, html, json, logging, os, shutil, sqlite3, subprocess, tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import httpx
 import asyncpg
@@ -15,7 +15,7 @@ load_dotenv(ROOT/'.env')
 logging.basicConfig(level=os.getenv('LOG_LEVEL','INFO'),format='%(asctime)s %(levelname)s %(message)s')
 log=logging.getLogger('callbot')
 # читают свои переменные окружения при импорте — обязательно после load_dotenv
-from analysis import analyze, review_call
+from analysis import CRITERIA, analyze, review_call
 # алиасы: у этого файла уже есть свои render_head/render_manager (старый ручной
 # аплоад) — импорт под своими именами их бы тихо подменил
 from reports import detail_button, fmt_call_time, render_head as pg_render_head, render_manager as pg_render_manager
@@ -246,7 +246,9 @@ async def help_command(message):
         '<b>Команды</b>\n'
         '/iam Фамилия — привязать этот чат к себе: личные разборы твоих звонков будут приходить сюда\n'
         '/stats — сводка по менеджерам\n'
-        '/reset — очистить статистику этого чата\n\n'
+        '/reset — очистить статистику этого чата\n'
+        '/check &lt;критерий&gt; [дней] — что модель увидела по критерию (руководителю)\n'
+        '/approvals — задачи, ждущие подтверждения (руководителю)\n\n'
         'chat_id этого чата: <code>{}</code> (пригодится для HEAD_CHAT_ID в .env)'.format(message.chat.id),
         parse_mode='HTML')
 
@@ -311,11 +313,28 @@ async def assign_train_command(message: Message):
     if actor is None or actor.role != 'head':
         await message.answer('Команда доступна только РОПу.')
         return
-    args = (message.text or '').split(maxsplit=2)
+    args = (message.text or '').split(maxsplit=3)
     if len(args) < 2:
-        await message.answer('Использование: /assign_train <добавочный> [тема]')
+        await message.answer(
+            'Использование: <code>/assign_train &lt;добавочный&gt; &lt;режим&gt; [тема]</code>\n\n'
+            '<b>Режимы</b>\n'
+            '• <code>разговор</code> — холодный звонок целиком, до 20 реплик\n'
+            '• <code>возражения</code> — отработка возражений поштучно, с разбором каждого ответа\n\n'
+            'Например: <code>/assign_train 13 возражения</code>', parse_mode='HTML')
         return
-    extension, topic = args[1], (args[2] if len(args) > 2 else None)
+    extension = args[1]
+    mode, topic = 'dialog', None
+    if len(args) > 2:
+        raw_mode = args[2].lower()
+        if raw_mode in ('возражения', 'отработка', 'drill'):
+            mode = 'drill'
+            topic = args[3] if len(args) > 3 else None
+        elif raw_mode in ('разговор', 'звонок', 'dialog'):
+            topic = args[3] if len(args) > 3 else None
+        else:
+            # Режим не указан — значит всё после добавочного это тема,
+            # как было до появления второго режима.
+            topic = ' '.join(args[2:])
     manager = await PG_POOL.fetchrow(
         "SELECT * FROM employees WHERE client_id=$1 AND extension=$2 AND role='manager'",
         actor.client_id, extension,
@@ -327,9 +346,10 @@ async def assign_train_command(message: Message):
         await message.answer(f'Менеджер (доб. {html.escape(extension)}) ещё не подключён к боту.')
         return
     assignment_id = await PG_POOL.fetchval(
-        """INSERT INTO pending_train_assignments (client_id, extension, topic, assigned_by_telegram_user_id)
-           VALUES ($1,$2,$3,$4) RETURNING id""",
-        actor.client_id, extension, topic, actor.telegram_user_id,
+        """INSERT INTO pending_train_assignments (client_id, extension, topic, mode,
+                                                   assigned_by_telegram_user_id)
+           VALUES ($1,$2,$3,$4,$5) RETURNING id""",
+        actor.client_id, extension, topic, mode, actor.telegram_user_id,
     )
     if not TRAIN_BOT_USERNAME:
         await message.answer('Не задан TRAIN_BOT_USERNAME в .env — ссылку на тренажёр не собрать.')
@@ -338,16 +358,158 @@ async def assign_train_command(message: Message):
         InlineKeyboardButton(text='Начать тренировку',
                               url=f'https://t.me/{TRAIN_BOT_USERNAME}?start=train_{assignment_id}')
     ]])
-    topic_line = f' по теме «{html.escape(topic)}»' if topic else ''
+    mode_line = 'отработка возражений' if mode == 'drill' else 'разговор целиком'
+    topic_line = f', тема «{html.escape(topic)}»' if topic else ''
     try:
-        await message.bot.send_message(manager['telegram_user_id'],
-                                        f'РОП назначил вам тренировку{topic_line}. Она пройдёт в боте-тренажёре.',
-                                        reply_markup=kb)
+        await message.bot.send_message(
+            manager['telegram_user_id'],
+            f'РОП назначил вам тренировку: {mode_line}{topic_line}. Она пройдёт в боте-тренажёре.',
+            reply_markup=kb)
     except Exception:
         log.exception('не удалось отправить уведомление о тренировке, доб.=%s', extension)
         await message.answer('Не удалось отправить уведомление менеджеру (возможно, он не запускал бота).')
         return
-    await message.answer(f'Назначено, доб. {html.escape(extension)} получит ссылку на тренажёр.')
+    await message.answer(
+        f'Назначено ({mode_line}), доб. {html.escape(extension)} получит ссылку на тренажёр.')
+
+
+# ------------------------------------------------ проверка критерия руками
+
+CHECK_DEFAULT_CALLS = 10
+CHECK_MAX_CALLS = 30
+
+
+# Слова, которыми критерий называют в разговоре, но которых нет в его
+# формулировке: «ЛПР» в названии критерия не встречается, а спросят именно так.
+CHECK_ALIASES = {
+    'лпр': 'decision_influence',
+    'цпр': 'decision_influence',
+    'инсайт': 'insight',
+    'монолог': 'talk_share',
+    'болтал': 'talk_share',
+    'перебивал': 'talk_share',
+}
+
+
+def _match_criterion(query: str) -> tuple[str, str] | None:
+    """Ищем критерий по куску названия, по ключу или по разговорному синониму:
+    руководитель пишет «извлекающие» или «ЛПР», а не implication_questions."""
+    q = query.strip().lower()
+    if not q:
+        return None
+    if q in CHECK_ALIASES:
+        key = CHECK_ALIASES[q]
+        return next((key, t) for k, _w, t in CRITERIA if k == key)
+    for key, _w, title in CRITERIA:
+        if q == key.lower() or q == title.lower():
+            return key, title
+    for key, _w, title in CRITERIA:
+        if q in title.lower() or q in key.lower():
+            return key, title
+    titles = {title.lower(): (key, title) for key, _w, title in CRITERIA}
+    close = difflib.get_close_matches(q, list(titles), n=1, cutoff=0.5)
+    return titles[close[0]] if close else None
+
+
+def _criteria_list() -> str:
+    return '\n'.join(f'• {html.escape(title)}' for _k, _w, title in CRITERIA)
+
+
+def _render_check(rows, key: str, title: str, days: int | None, client_tz: str) -> str:
+    """Собирает ответ /check. Вынесено из обработчика, чтобы вывод можно было
+    проверить на реальных данных, не поднимая Telegram."""
+    header = f'<b>{html.escape(title)}</b>\n'
+    header += f'за последние {days} дн.' if days else f'последние {len(rows)} звонков'
+
+    lines, applicable, failed = [], 0, 0
+    for r in rows:
+        analysis = json.loads(r['analysis'])
+        row = next((x for x in (analysis.get('rows') or []) if x.get('key') == key), None)
+        name = r['full_name'] or f"доб. {r['extension']}"
+        # У части звонков время начала не пришло от Манго — fmt_call_time
+        # вернёт None, и без запасного значения команда падала бы у РОПа в чате.
+        when = fmt_call_time(r['call_started_at'], client_tz) or 'время неизвестно'
+        if row is None or not row.get('applicable'):
+            mark = '— неприменим'
+        else:
+            applicable += 1
+            if row.get('passed'):
+                mark = '✅ пройден'
+            else:
+                failed += 1
+                mark = '❌ провален'
+        evidence = (row or {}).get('evidence') or '(обоснование не записано)'
+        lines.append(
+            f"\n\n<b>#{r['call_id']}</b> · {html.escape(when)} · {html.escape(name)} · {mark}\n"
+            f"<i>{html.escape(str(evidence)[:400])}</i>"
+        )
+
+    summary = f'\n\nПровален в {failed} из {applicable} применимых.'
+    if applicable and failed == applicable:
+        summary += ('\nКритерий не различает менеджеров. Если обоснования выглядят как '
+                    '«не было попытки» — критерий верен, и учить надо команду. Если модель '
+                    'отвергает то, что по сути засчитывается, — стоит поправить формулировку '
+                    'критерия (это решение человека, бот её не меняет).')
+    return header + ''.join(lines) + summary
+
+
+@router.message(Command('check'))
+async def check_command(message: Message):
+    """Показывает, ЧТО именно модель увидела по критерию: свой вердикт и
+    обоснование (evidence) по последним звонкам. Нужна, чтобы отличить
+    «менеджеры правда так работают» от «модель придирается к формулировке» —
+    на слух это проверять слишком долго. Формулировки критериев по итогам
+    проверки меняет человек, не бот."""
+    if PG_POOL is None:
+        return
+    actor = await resolve_actor(PG_POOL, message.from_user.id)
+    if actor is None or actor.role != 'head':
+        await message.answer('Команда доступна только руководителю.')
+        return
+
+    args = (message.text or '').split()[1:]
+    days = None
+    if args and args[-1].isdigit():
+        days = int(args[-1])
+        args = args[:-1]
+    matched = _match_criterion(' '.join(args))
+    if matched is None:
+        await message.answer(
+            'Использование: <code>/check &lt;критерий&gt; [дней]</code>\n'
+            'Например: <code>/check извлекающие</code> или <code>/check отговорка 7</code>\n\n'
+            '<b>Критерии</b>\n' + _criteria_list(), parse_mode='HTML')
+        return
+    key, title = matched
+
+    cutoff = None
+    limit = CHECK_DEFAULT_CALLS
+    if days:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        limit = CHECK_MAX_CALLS
+
+    rows = await PG_POOL.fetch(
+        """
+        SELECT a.call_id, a.analysis, a.level, c.call_started_at, c.extension, e.full_name
+        FROM astra_analysis a
+        JOIN calls c ON c.id = a.call_id
+        LEFT JOIN employees e ON e.client_id = c.client_id AND e.extension = c.extension
+                              AND e.role = 'manager'
+        WHERE a.status = 'analyzed' AND a.analysis IS NOT NULL AND c.client_id = $1
+          AND ($2::timestamptz IS NULL OR c.call_started_at >= $2)
+        -- NULLS LAST обязателен: у части звонков Манго не отдала время начала,
+        -- а в Postgres при DESC пустые идут первыми — «последние звонки»
+        -- оказались бы как раз теми, у которых времени нет.
+        ORDER BY c.call_started_at DESC NULLS LAST
+        LIMIT $3
+        """,
+        actor.client_id, cutoff, limit,
+    )
+    if not rows:
+        await message.answer('Разобранных звонков за этот период нет.')
+        return
+
+    client_tz = await PG_POOL.fetchval('SELECT timezone FROM clients WHERE id=$1', actor.client_id)
+    await send_chunks(message.bot, message.chat.id, _render_check(rows, key, title, days, client_tz))
 
 
 # --------------------------------------------------- очередь на подтверждение
