@@ -346,7 +346,7 @@ async def maybe_enqueue_rop_digests(pool: asyncpg.Pool) -> None:
 
 # -------------------------------------------------------------------- дайджест
 
-LEVELS = ("✅", "❌", "❌❌")
+LEVELS = ("✅", "⚠️", "❌")
 
 CRITERION_BUCKET = {
     "call_reason": "скрипт", "gatekeeper_passed": "скрипт",
@@ -358,6 +358,25 @@ BUCKET_HINT = {
     "менеджер": "похоже, дело в технике самого разговора — стоит потренировать этот момент отдельно",
     "скрипт": "похоже, дело в самой структуре звонка (повод, выход на нужного человека) — стоит пересмотреть сценарий",
 }
+
+
+def _unrated(rows) -> int:
+    """Звонки без вердикта: модель пометила их как оборванные — слишком
+    короткие, рваные или вообще автоответчик («Вас приветствует компания…»),
+    судить о работе менеджера там не по чему. Их обязательно показывать
+    отдельной цифрой: раньше дайджест писал «разобрано 6» и рисовал нули по
+    уровням, и выглядело это как «шесть звонков на ноль», хотя оценивать было
+    нечего."""
+    return sum(1 for r in rows if not r["level"])
+
+
+def _fmt_levels(rows) -> str:
+    c = _level_counts(rows)
+    out = f"✅ {c['✅']} · ⚠️ {c['⚠️']} · ❌ {c['❌']}"
+    unrated = _unrated(rows)
+    if unrated:
+        out += f" · без оценки {unrated}"
+    return out
 
 
 def _level_counts(rows) -> dict[str, int]:
@@ -393,11 +412,11 @@ async def build_manager_digest(pool: asyncpg.Pool, client: asyncpg.Record, exten
     counts = _level_counts(rows)
     out = [
         f"<b>📊 Дайджест за день</b> · {esc(name)}",
-        f"Звонков: {len(rows)} — ✅ {counts['✅']} · ❌ {counts['❌']} · ❌❌ {counts['❌❌']}",
+        f"Звонков: {len(rows)} — {_fmt_levels(rows)}",
     ]
-    not_yet_sent = [r for r in rows if not r["immediate_sent_manager"] and r["level"] in ("❌", "❌❌")]
+    not_yet_sent = [r for r in rows if not r["immediate_sent_manager"] and r["level"] in ("⚠️", "❌")]
     if not_yet_sent:
-        worst = min(not_yet_sent, key=lambda r: 0 if r["level"] == "❌❌" else 1)
+        worst = min(not_yet_sent, key=lambda r: 0 if r["level"] == "❌" else 1)
         line = _one_liner(worst["short_report"])
         if line:
             out += ["", "<b>Худший звонок сегодня</b>", line]
@@ -439,14 +458,19 @@ async def build_head_digest(pool: asyncpg.Pool, client: asyncpg.Record,
     def _share(ext_rows):
         c = _level_counts(ext_rows)
         n = len(ext_rows)
-        return c["✅"] / n, c["❌❌"] / n
+        return c["✅"] / n, c["❌"] / n
 
     ranking = sorted(per_manager.items(), key=lambda kv: (-_share(kv[1])[0], _share(kv[1])[1]))
-    out = ["<b>📊 Дайджест РОПу за день</b>", f"Всего звонков разобрано: {len(rows)}"]
+    unrated = _unrated(rows)
+    header = f"Всего звонков разобрано: {len(rows)}"
+    if unrated:
+        header += (f", из них {unrated} без оценки — оборванные или автоответчик, "
+                   f"судить там не по чему")
+    out = ["<b>📊 Дайджест РОПу за день</b>", header]
     for ext, ext_rows in ranking:
         c = _level_counts(ext_rows)
-        out.append(f"• {esc(names.get(ext) or ext)} — ✅ {c['✅']} · ❌ {c['❌']} · ❌❌ {c['❌❌']}")
-        worst = next((r for r in ext_rows if r["level"] in ("❌", "❌❌")), None)
+        out.append(f"• {esc(names.get(ext) or ext)} — {_fmt_levels(ext_rows)}")
+        worst = next((r for r in ext_rows if r["level"] in ("⚠️", "❌")), None)
         line = _one_liner(worst["short_report"]) if worst else None
         if line:
             out.append(f"   Худший звонок: {line}")

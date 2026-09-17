@@ -50,29 +50,29 @@ def _verdict(scores: dict, by_key: dict, rule: str) -> str | None:
     critical = _failed_critical(by_key)
     missed = _missed_signals(scores)
 
-    if rule == "current":       # ❌❌ при одном ключевом ИЛИ упущенном сигнале
+    if rule == "current":       # ❌ при одном ключевом ИЛИ упущенном сигнале
         double = bool(critical) or bool(missed)
-    elif rule == "two":         # ❌❌ при двух ключевых (сигнал сам по себе не решает)
+    elif rule == "two":         # ❌ при двух ключевых (сигнал сам по себе не решает)
         double = len(critical) >= 2
-    elif rule == "three":       # ❌❌ только когда провалены все три ключевых
+    elif rule == "three":       # ❌ только когда провалены все три ключевых
         double = len(critical) >= 3
-    elif rule == "two_or_mix":  # ❌❌ при двух ключевых ИЛИ ключевой вместе с сигналом
+    elif rule == "two_or_mix":  # ❌ при двух ключевых ИЛИ ключевой вместе с сигналом
         double = len(critical) >= 2 or (len(critical) >= 1 and bool(missed))
-    elif rule == "three_or_two_mix":  # ❌❌ при трёх ключевых ИЛИ двух вместе с сигналом
+    elif rule == "three_or_two_mix":  # ❌ при трёх ключевых ИЛИ двух вместе с сигналом
         double = len(critical) >= 3 or (len(critical) >= 2 and bool(missed))
     elif rule == "two_no_decision":
-        # ❌❌ при двух ключевых, но «выяснено, кто влияет на решение» не
+        # ❌ при двух ключевых, но «выяснено, кто влияет на решение» не
         # считается: он проваливается в 90% и сам по себе обваливает шкалу.
         hard = [k for k in critical if k != "decision_influence"]
         double = len(hard) >= 2 or (len(hard) >= 1 and bool(missed))
     else:
         raise ValueError(rule)
-    return "❌❌" if double else "❌"
+    return "❌" if double else "⚠️"
 
 
 def _fmt_dist(counter: Counter, total: int) -> str:
     parts = []
-    for level in ("✅", "❌", "❌❌"):
+    for level in ("✅", "⚠️", "❌"):
         n = counter.get(level, 0)
         share = f"{n / total * 100:.0f}%" if total else "—"
         parts.append(f"{level} {n} ({share})")
@@ -117,7 +117,7 @@ async def main() -> None:
     print("ТЕКУЩЕЕ РАСПРЕДЕЛЕНИЕ")
     print("=" * 62)
     stored = Counter(p["level"] or "нет вердикта" for p in parsed)
-    for level in ("✅", "❌", "❌❌", "нет вердикта"):
+    for level in ("✅", "⚠️", "❌", "нет вердикта"):
         print(f"  {level:<12} {stored.get(level, 0)}")
 
     no_verdict = [p for p in parsed if not p["level"]]
@@ -133,9 +133,9 @@ async def main() -> None:
     scored = [p for p in parsed if not p["scores"].get("call_cut_short")]
     print(f"\nЗвонков, по которым вердикт вообще возможен: {len(scored)}")
 
-    # ------------------------------------------------------- триггеры ❌❌
+    # ------------------------------------------------------- триггеры ❌
     print("\n" + "=" * 62)
-    print("ЧАСТОТА СРАБАТЫВАНИЯ КАЖДОГО ТРИГГЕРА ❌❌")
+    print("ЧАСТОТА СРАБАТЫВАНИЯ КАЖДОГО ТРИГГЕРА ❌")
     print("=" * 62)
     print("(считаем только по звонкам без успеха — там, где вердикт решают триггеры)")
     no_success = [
@@ -172,20 +172,20 @@ async def main() -> None:
     print("РАСПРЕДЕЛЕНИЕ ПРИ РАЗНЫХ ПРАВИЛАХ")
     print("=" * 62)
     rules = [
-        ("current", "❌❌ при одном ключевом или упущенном сигнале (текущее)"),
-        ("two", "❌❌ при двух проваленных ключевых"),
-        ("three", "❌❌ при всех трёх проваленных ключевых"),
-        ("two_or_mix", "❌❌ при двух ключевых ИЛИ ключевой + упущенный сигнал"),
-        ("three_or_two_mix", "❌❌ при трёх ключевых ИЛИ двух + упущенный сигнал [сверх списка]"),
-        ("two_no_decision", "❌❌ при двух ключевых без учёта «кто влияет на решение» [сверх списка]"),
+        ("current", "❌ при одном ключевом или упущенном сигнале (текущее)"),
+        ("two", "❌ при двух проваленных ключевых"),
+        ("three", "❌ при всех трёх проваленных ключевых"),
+        ("two_or_mix", "❌ при двух ключевых ИЛИ ключевой + упущенный сигнал"),
+        ("three_or_two_mix", "❌ при трёх ключевых ИЛИ двух + упущенный сигнал [сверх списка]"),
+        ("two_no_decision", "❌ при двух ключевых без учёта «кто влияет на решение» [сверх списка]"),
     ]
     for rule, label in rules:
         counter = Counter()
         for p in scored:
             counter[_verdict(p["scores"], p["by_key"], rule)] += 1
         n = sum(counter.values())
-        double_share = counter.get("❌❌", 0) / n * 100 if n else 0
-        flag = "  ← цель: ❌❌ не больше трети" if double_share <= 34 else ""
+        double_share = counter.get("❌", 0) / n * 100 if n else 0
+        flag = "  ← цель: ❌ не больше трети" if double_share <= 34 else ""
         print(f"\n{label}")
         print(f"  {_fmt_dist(counter, n)}{flag}")
 
@@ -222,7 +222,7 @@ async def main() -> None:
         by_manager[p["name"]].append(p)
     for name, items in sorted(by_manager.items(), key=lambda kv: -len(kv[1])):
         counter = Counter(p["level"] or "нет вердикта" for p in items)
-        line = " · ".join(f"{lvl} {counter.get(lvl, 0)}" for lvl in ("✅", "❌", "❌❌", "нет вердикта"))
+        line = " · ".join(f"{lvl} {counter.get(lvl, 0)}" for lvl in ("✅", "⚠️", "❌", "нет вердикта"))
         print(f"  {name:<24} звонков {len(items):>3}   {line}")
 
     days = {p["day"] for p in parsed if p["day"]}

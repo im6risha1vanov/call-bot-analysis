@@ -29,7 +29,7 @@ from analysis import (LEVEL_CRITICAL_CRITERIA, VERDICT_MIN_FAILURES,
 
 async def main() -> None:
     apply = "--apply" in sys.argv
-    print(f"Правило: ❌❌ при {VERDICT_MIN_FAILURES} проваленных ключевых "
+    print(f"Правило: ❌ при {VERDICT_MIN_FAILURES} проваленных ключевых "
           f"или при {VERDICT_MIN_FAILURES_WITH_SIGNAL} вместе с упущенным сигналом")
     print(f"Ключевые критерии: {', '.join(sorted(LEVEL_CRITICAL_CRITERIA))}")
     print(f"Режим: {'ПРИМЕНЯЮ изменения' if apply else 'только показываю (без --apply)'}\n")
@@ -72,7 +72,7 @@ async def main() -> None:
         analysis = json.loads(r["analysis"])
         after[compute_level(analysis, analysis.get("rows") or []) or "нет вердикта"] += 1
     print("\nРаспределение после пересчёта:")
-    for level in ("✅", "❌", "❌❌", "нет вердикта"):
+    for level in ("✅", "⚠️", "❌", "нет вердикта"):
         print(f"  {level:<12} {after.get(level, 0)}")
 
     await pool.close()
