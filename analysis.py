@@ -122,7 +122,7 @@ def compute_score(scores: dict) -> tuple[int | None, list[dict]]:
     обрывочный/слишком короткий звонок получал обычный числовой балл (часто
     0), хотя оценивать было нечего. Тот же класс бага, что чинили на
     Claude-стороне — портируем фикс, иначе сравнение уровней между движками
-    на коротких звонках будет нечестным (Astra всегда покажет ❌❌, Claude —
+    на коротких звонках будет нечестным (Astra всегда покажет ❌, Claude —
     честное "нет данных")."""
     if scores.get("call_cut_short"):
         return None, []
@@ -156,7 +156,7 @@ def compute_score(scores: dict) -> tuple[int | None, list[dict]]:
 # нужно.
 #
 # Прежнее правило («хватает одного ключевого или одного упущенного сигнала»)
-# давало на реальных данных 86% ❌❌ и ноль ❌ — шкала из трёх уровней, где
+# давало на реальных данных 86% ❌ и ноль ⚠️ — шкала из трёх уровней, где
 # средний недостижим, это шкала из двух. Причина: критерий «выяснено, кто
 # влияет на решение» проваливается в 90% звонков и в одиночку обваливал всё.
 # Пороги подобраны не на глаз, а пересчётом сохранённых разборов — см.
@@ -166,7 +166,7 @@ LEVEL_CRITICAL_CRITERIA = set(
      or "brush_off_handled,no_early_pitch,decision_influence").replace(" ", "").split(",")
 )
 
-# Сколько ключевых критериев должно быть провалено для ❌❌.
+# Сколько ключевых критериев должно быть провалено для ❌.
 VERDICT_MIN_FAILURES = int(os.getenv("VERDICT_MIN_FAILURES", "3"))
 
 # Сколько провалов достаточно, если вдобавок упущен сигнал (названное третье
@@ -192,7 +192,7 @@ def compute_level(scores: dict, rows: list[dict]) -> str | None:
         or any(not a.get("followed_up") for a in signals.get("problem_agreements") or [])
     )
     double = failed >= VERDICT_MIN_FAILURES or (missed_signal and failed >= VERDICT_MIN_FAILURES_WITH_SIGNAL)
-    return "❌❌" if double else "❌"
+    return "❌" if double else "⚠️"
 
 
 def build_brief(scores: dict, rows: list[dict]) -> str:

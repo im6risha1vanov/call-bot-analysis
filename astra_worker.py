@@ -33,6 +33,7 @@ import mango_client
 from analysis import CRITERIA
 from crypto_util import decrypt
 from reports import esc, send_long
+from tools import head_chat_ids
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("callbot-astra-worker")
@@ -57,9 +58,6 @@ def _day_bounds(client: asyncpg.Record, offset_days: int = 0) -> tuple[datetime,
     return start, start + timedelta(days=1)
 
 
-async def _head_chat_id(pool: asyncpg.Pool, client_id: int) -> int | None:
-    row = await pool.fetchrow("SELECT telegram_user_id FROM employees WHERE client_id=$1 AND role='head'", client_id)
-    return row["telegram_user_id"] if row else None
 
 
 # -------------------------------------------------------------------- опрос
@@ -200,20 +198,22 @@ async def _send_poll_error(pool: asyncpg.Pool, client: asyncpg.Record, error: st
     now = time.monotonic()
     if now - _last_error_notice.get(client["id"], 0) < ERROR_NOTICE_COOLDOWN_SEC:
         return
-    head_id = await _head_chat_id(pool, client["id"])
-    if not head_id:
+    chat_ids = await head_chat_ids(pool, client["id"])
+    if not chat_ids:
         return
     _last_error_notice[client["id"]] = now
     tz = ZoneInfo(client["timezone"])
     stamp = datetime.now(tz).strftime("%d.%m %H:%M")
-    try:
-        await bot.send_message(
-            head_id,
-            f"⚠️ Astra: ошибка опроса Mango в {stamp} — {esc(error)[:300]}. "
-            f"Продолжаю попытки, следующее сообщение об этой проблеме — не раньше чем через час.",
-        )
-    except Exception:
-        log.exception("не удалось отправить сообщение об ошибке опроса РОПу")
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(
+                chat_id,
+                f"⚠️ Astra: ошибка опроса Mango в {stamp} — {esc(error)[:300]}. "
+                f"Продолжаю попытки, следующее сообщение об этой проблеме — не раньше чем через час.",
+                parse_mode="HTML",  # текст ошибки прогнан через esc()
+            )
+        except Exception:
+            log.exception("не удалось отправить сообщение об ошибке опроса, chat_id=%s", chat_id)
 
 
 async def poll_all_clients(pool: asyncpg.Pool, next_poll_at: dict[int, float]) -> None:
@@ -491,7 +491,7 @@ async def maybe_send_digest_for_client(pool: asyncpg.Pool, client: asyncpg.Recor
 
     employees = await pool.fetch("SELECT * FROM employees WHERE client_id=$1", client["id"])
     by_ext = {e["extension"]: e for e in employees if e["role"] == "manager"}
-    head = next((e for e in employees if e["role"] == "head"), None)
+    heads = await head_chat_ids(pool, client["id"])
 
     for ext in sorted({p["extension"] for p in pending if p["extension"]}):
         emp = by_ext.get(ext)
@@ -504,13 +504,14 @@ async def maybe_send_digest_for_client(pool: asyncpg.Pool, client: asyncpg.Recor
             except Exception:
                 log.exception("не удалось отправить дайджест менеджеру доб.=%s", ext)
 
-    if head and head["telegram_user_id"]:
+    if heads:
         text = await build_head_digest(pool, client, today_start, today_end)
         if text:
-            try:
-                await send_long(bot, head["telegram_user_id"], text)
-            except Exception:
-                log.exception("не удалось отправить дайджест РОПу")
+            for chat_id in heads:
+                try:
+                    await send_long(bot, chat_id, text)
+                except Exception:
+                    log.exception("не удалось отправить вечерний дайджест руководителю, chat_id=%s", chat_id)
 
     await pool.execute(
         """UPDATE astra_analysis a SET digest_included=true, updated_at=now()

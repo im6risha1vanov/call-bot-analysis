@@ -50,6 +50,19 @@ async def resolve_actor(pool: asyncpg.Pool, telegram_user_id: int) -> Actor | No
                  role=row["role"], extension=row["extension"])
 
 
+async def head_chat_ids(pool: asyncpg.Pool, client_id: int) -> list[int]:
+    """Все руководители клиента, привязанные к боту. Раньше отчёты уходили
+    через fetchrow(... role='head'), то есть одному — какому именно, решал
+    порядок строк. С появлением второго руководителя это значило бы «кому-то
+    одному, кому повезёт»."""
+    rows = await pool.fetch(
+        "SELECT telegram_user_id FROM employees "
+        "WHERE client_id=$1 AND role='head' AND telegram_user_id IS NOT NULL ORDER BY id",
+        client_id,
+    )
+    return [r["telegram_user_id"] for r in rows]
+
+
 def _scope_extension(actor: Actor, requested: str | None) -> str | None:
     """Единственное место, решающее, чьи звонки видно. Менеджер всегда видит
     только себя — параметр requested для него игнорируется полностью, даже
@@ -85,6 +98,15 @@ def _weak_point(short_report_json) -> str | None:
     return weak.get("text") if weak else None
 
 
+def _local_iso(dt, tz_name: str) -> str | None:
+    """Время наружу — всегда в часовом поясе клиента. В базе timestamptz, и
+    asyncpg отдаёт его в UTC: без перевода агент РОПа показывал бы руководителю
+    время сервера вместо московского."""
+    if dt is None:
+        return None
+    return dt.astimezone(ZoneInfo(tz_name)).isoformat(timespec="minutes")
+
+
 def _drill_summary(drill_state_json) -> dict | None:
     """Сводка по отработке возражений: сколько зачтено и какие именно не
     зачтены — агенту РОПа этого хватает, полные ответы менеджера ему не нужны."""
@@ -99,7 +121,7 @@ def _drill_summary(drill_state_json) -> dict | None:
 
 
 def _level_counts(rows) -> dict[str, int]:
-    counts = {"✅": 0, "❌": 0, "❌❌": 0}
+    counts = {"✅": 0, "⚠️": 0, "❌": 0}
     for r in rows:
         if r["level"] in counts:
             counts[r["level"]] += 1
@@ -140,9 +162,9 @@ async def find_calls(pool: asyncpg.Pool, actor: Actor, period: dict | None = Non
                       manager_extension: str | None = None, level: str | None = None,
                       limit: int = 20) -> list[dict]:
     extension = _scope_extension(actor, manager_extension)
+    client = await _require_client(pool, actor.client_id)
     start, end = (None, None)
     if period:
-        client = await _require_client(pool, actor.client_id)
         start, end = _period_bounds(client["timezone"], period)
     limit = min(int(limit), 100)
 
@@ -155,7 +177,9 @@ async def find_calls(pool: asyncpg.Pool, actor: Actor, period: dict | None = Non
           AND ($3::timestamptz IS NULL OR a.updated_at >= $3)
           AND ($4::timestamptz IS NULL OR a.updated_at < $4)
           AND ($5::text IS NULL OR a.level = $5)
-        ORDER BY c.call_started_at DESC
+        -- NULLS LAST: у части звонков Манго не отдала время начала, а при DESC
+        -- пустые идут первыми — агент получал бы их как «самые свежие».
+        ORDER BY c.call_started_at DESC NULLS LAST
         LIMIT $6
         """,
         actor.client_id, extension, start, end, level, limit,
@@ -164,7 +188,7 @@ async def find_calls(pool: asyncpg.Pool, actor: Actor, period: dict | None = Non
         {
             "call_id": r["id"],
             "manager_extension": r["extension"],
-            "started_at": r["call_started_at"].isoformat() if r["call_started_at"] else None,
+            "started_at": _local_iso(r["call_started_at"], client["timezone"]),
             "duration_seconds": r["duration_seconds"],
             "level": r["level"],
             "weak_point": _weak_point(r["short_report"]),
@@ -190,10 +214,11 @@ async def get_call(pool: asyncpg.Pool, actor: Actor, call_id: int) -> dict:
     if actor.role == "manager" and row["extension"] != actor.extension:
         raise Forbidden(f"звонок {call_id} принадлежит другому менеджеру")
 
+    client = await _require_client(pool, actor.client_id)
     return {
         "call_id": row["id"],
         "manager_extension": row["extension"],
-        "started_at": row["call_started_at"].isoformat() if row["call_started_at"] else None,
+        "started_at": _local_iso(row["call_started_at"], client["timezone"]),
         "duration_seconds": row["duration_seconds"],
         "level": row["level"],
         "transcript": row["transcript"],
@@ -334,6 +359,7 @@ async def get_training_history(pool: asyncpg.Pool, actor: Actor, manager_extensi
     линейкой (score_call/compute_level), что и реальные звонки, поэтому level
     здесь сравним с level в get_stats/find_calls."""
     extension = _scope_extension(actor, manager_extension)
+    client = await _require_client(pool, actor.client_id)
     limit = min(int(limit), 50)
     rows = await pool.fetch(
         """
@@ -341,6 +367,10 @@ async def get_training_history(pool: asyncpg.Pool, actor: Actor, manager_extensi
                mode, drill_state, started_at, ended_at
         FROM training_sessions
         WHERE client_id = $1 AND ($2::text IS NULL OR extension = $2)
+          -- Пробные прогоны руководителя (он смотрит, годится ли тренажёр)
+          -- в статистику отдела не идут: иначе агент считал бы их работой
+          -- менеджеров.
+          AND is_test = false
         ORDER BY started_at DESC LIMIT $3
         """,
         actor.client_id, extension, limit,
@@ -355,8 +385,8 @@ async def get_training_history(pool: asyncpg.Pool, actor: Actor, manager_extensi
             # поштучно: level не ставится, score — доля зачтённых ответов.
             "mode": r["mode"],
             "objections_handled": _drill_summary(r["drill_state"]) if r["mode"] == "drill" else None,
-            "started_at": r["started_at"].isoformat() if r["started_at"] else None,
-            "ended_at": r["ended_at"].isoformat() if r["ended_at"] else None,
+            "started_at": _local_iso(r["started_at"], client["timezone"]),
+            "ended_at": _local_iso(r["ended_at"], client["timezone"]),
         }
         for r in rows
     ]
@@ -376,7 +406,7 @@ _PERIOD_SCHEMA = {
 TOOL_SCHEMAS = [
     {
         "name": "get_stats",
-        "description": "Сводная статистика по звонкам за период: сколько всего, разбивка по уровням ✅/❌/❌❌, доля успеха.",
+        "description": "Сводная статистика по звонкам за период: сколько всего, разбивка по уровням ✅/⚠️/❌, доля успеха.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -395,7 +425,7 @@ TOOL_SCHEMAS = [
             "properties": {
                 "period": _PERIOD_SCHEMA,
                 "manager_extension": {"type": ["string", "null"]},
-                "level": {"type": ["string", "null"], "enum": ["✅", "❌", "❌❌", None]},
+                "level": {"type": ["string", "null"], "enum": ["✅", "⚠️", "❌", None]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
             },
             "required": [],
@@ -471,7 +501,7 @@ TOOL_SCHEMAS = [
     {
         "name": "get_training_history",
         "description": ("История тренировок в тренажёре возражений: кто тренировался, по какому сценарию/теме, "
-                         "с каким уровнем (той же линейкой ✅/❌/❌❌, что и реальные звонки) и был ли сдвиг. "
+                         "с каким уровнем (той же линейкой ✅/⚠️/❌, что и реальные звонки) и был ли сдвиг. "
                          "status='active' — тренировка ещё идёт, у неё пока нет level."),
         "input_schema": {
             "type": "object",

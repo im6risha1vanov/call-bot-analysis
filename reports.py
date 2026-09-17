@@ -45,7 +45,10 @@ async def send_long(bot: Bot, chat_id: int, text: str) -> None:
         cut = min(4000, len(text))
         if len(text) > 4000:
             cut = max(text.rfind("\n", 0, cut), 1)
-        await bot.send_message(chat_id, text[:cut])
+        # parse_mode обязателен явно: в aiogram 3.7+ режим по умолчанию задаётся
+        # только через DefaultBotProperties, и без него теги <b> уезжали в чат
+        # текстом. Динамические куски в отчётах экранируются esc().
+        await bot.send_message(chat_id, text[:cut], parse_mode="HTML")
         text = text[cut:].lstrip()
 
 
@@ -104,7 +107,7 @@ async def send_short_report(bot: Bot, chat_id: int, text: str, markup: InlineKey
             cut = 4000
         log.warning("короткий отчёт превысил 4000 символов (%d) — обрезан", len(text))
         text = text[:cut]
-    await bot.send_message(chat_id, text, reply_markup=markup)
+    await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
 
 
 def render_head(result: dict, manager: str, duration: float, cost: float, manager_status: str,

@@ -5,7 +5,7 @@
 сообщение означало две разные вещи — ход тренировки, если у менеджера есть
 активная сессия, и запись реального звонка на разбор, если нет. Менеджер с
 открытой тренировкой не мог загрузить настоящий звонок, а посреди ролевой
-игры в тот же чат прилетал ❌❌-отчёт и ломал её. Здесь разведение по ботам:
+игры в тот же чат прилетал ❌-отчёт и ломал её. Здесь разведение по ботам:
 этот чат — клиент, тот чат — аналитик.
 
 Сама логика тренировки живёт в training_simulator.py и от Telegram не
@@ -52,9 +52,16 @@ START_TEXT = (
     'Это тренажёр возражений. Я играю клиента, которому вы звоните вхолодную — '
     'занятого и не настроенного разговаривать.\n\n'
     'Команда /train начинает тренировку. Отвечать можно голосовыми сообщениями '
-    '(как в реальном звонке) или текстом.\n\n'
+    '(как в реальном звонке) или текстом. Закончить в любой момент — кнопкой '
+    'под репликой клиента или командой /stop.\n\n'
     'Разбор реальных звонков и вопросы по статистике — в основном боте, здесь только тренировка.'
 )
+
+
+def _stop_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='Завершить тренировку', callback_data='train_stop')
+    ]])
 
 
 async def _send_training_reply(message: Message, result: training_simulator.TurnResult) -> None:
@@ -63,18 +70,25 @@ async def _send_training_reply(message: Message, result: training_simulator.Turn
 
     result.note (разбор предыдущего ответа в режиме отработки) уходит текстом
     отдельно: это голос тренера, а не клиента, озвучивать его нельзя."""
+    # Реплики тренажёра — обычная речь, разметка тут не нужна: шлём как есть,
+    # без экранирования и без parse_mode. С экранированием, но без parse_mode
+    # в чат уезжали бы &quot; вместо кавычек.
     if result.note:
-        await message.answer(html.escape(result.note))
+        await message.answer(result.note)
     if not result.reply_text:
         return
+    # Кнопка висит на реплике клиента, пока тренировка идёт: выйти можно в любой
+    # момент, а не только досидев до конца.
+    markup = None if result.ended else _stop_keyboard()
     try:
         ogg_bytes, _cost = await tts.synthesize_ogg(result.reply_text)
-        await message.bot.send_voice(message.chat.id, voice=BufferedInputFile(ogg_bytes, filename='client.ogg'))
+        await message.bot.send_voice(message.chat.id, voice=BufferedInputFile(ogg_bytes, filename='client.ogg'),
+                                      reply_markup=markup)
     except tts.TTSNotConfigured:
-        await message.answer(html.escape(result.reply_text))
+        await message.answer(result.reply_text, reply_markup=markup)
     except Exception:
         log.exception('ошибка синтеза речи тренажёра')
-        await message.answer(html.escape(result.reply_text))
+        await message.answer(result.reply_text, reply_markup=markup)
 
 
 async def _process_turn(message: Message, session, manager_text: str) -> None:
@@ -109,7 +123,7 @@ async def _launch(message: Message, actor, topic: str | None, assigned_by: str |
         return
     client = await PG_POOL.fetchrow('SELECT timezone FROM clients WHERE id=$1', actor.client_id)
     tz_name = client['timezone'] if client else 'Europe/Moscow'
-    done_today = await training_simulator.sessions_today(PG_POOL, actor.client_id, actor.extension, tz_name)
+    done_today = await training_simulator.sessions_today(PG_POOL, actor.client_id, training_simulator.actor_key(actor), tz_name)
     if done_today >= training_simulator.MAX_SESSIONS_PER_DAY:
         await message.answer(
             f'Уже {done_today} тренировки сегодня — дневной лимит ({training_simulator.MAX_SESSIONS_PER_DAY}) исчерпан.')
@@ -123,15 +137,15 @@ async def _launch(message: Message, actor, topic: str | None, assigned_by: str |
     await _send_training_reply(message, training_simulator.TurnResult(opening, False))
 
 
-async def _require_manager(message: Message):
+async def _require_employee(message: Message):
+    """Руководителя тоже пускаем: он должен иметь возможность пройти тренажёр
+    сам и решить, годится ли инструмент для отдела. Его сессии помечаются
+    пробными и в статистику отдела не попадают."""
     if PG_POOL is None:
         return None
     actor = await resolve_actor(PG_POOL, message.from_user.id)
     if actor is None:
         await message.answer('Вы не привязаны к системе. Попросите РОПа прислать ссылку /invite в основном боте.')
-        return None
-    if actor.role != 'manager':
-        await message.answer('Тренажёр предназначен для менеджеров.')
         return None
     return actor
 
@@ -146,7 +160,7 @@ async def start_command(message: Message, command: CommandObject):
         await message.answer(START_TEXT)
         return
 
-    actor = await _require_manager(message)
+    actor = await _require_employee(message)
     if actor is None:
         return
     try:
@@ -167,6 +181,49 @@ async def start_command(message: Message, command: CommandObject):
                   mode=assignment['mode'])
 
 
+@router.callback_query(F.data == 'train_stop')
+async def train_stop_callback(cq: CallbackQuery):
+    if PG_POOL is None:
+        await cq.answer()
+        return
+    actor = await resolve_actor(PG_POOL, cq.from_user.id)
+    if actor is None:
+        await cq.answer('Вы не привязаны к системе.', show_alert=True)
+        return
+    session = await training_simulator.get_active_session(PG_POOL, actor)
+    if session is None:
+        await cq.answer('Активной тренировки нет.', show_alert=True)
+        return
+    await cq.answer()
+    try:
+        await cq.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    try:
+        text, level = await training_simulator.end_session_early(PG_POOL, session)
+    except Exception:
+        log.exception('ошибка досрочного завершения, session id=%s', session['id'])
+        await cq.message.answer('Не удалось завершить тренировку, попробуйте ещё раз.')
+        return
+    level_line = f' Уровень: {level}.' if level else ''
+    await cq.message.answer(f'{text}{level_line}')
+
+
+@router.message(Command('stop'))
+async def stop_command(message: Message):
+    """То же, что кнопка — на случай, если она уехала вверх по переписке."""
+    actor = await _require_employee(message)
+    if actor is None:
+        return
+    session = await training_simulator.get_active_session(PG_POOL, actor)
+    if session is None:
+        await message.answer('Активной тренировки нет. Начать: /train')
+        return
+    text, level = await training_simulator.end_session_early(PG_POOL, session)
+    level_line = f' Уровень: {level}.' if level else ''
+    await message.answer(f'{text}{level_line}')
+
+
 @router.message(Command('help'))
 async def help_command(message: Message):
     await message.answer(START_TEXT)
@@ -183,7 +240,7 @@ def _mode_keyboard() -> InlineKeyboardMarkup:
 async def train_command(message: Message):
     """Режим можно задать сразу (/train возражения), иначе спрашиваем кнопками —
     менеджеру не нужно помнить синтаксис."""
-    actor = await _require_manager(message)
+    actor = await _require_employee(message)
     if actor is None:
         return
     arg = (message.text or '').partition(' ')[2].strip().lower()
@@ -201,8 +258,8 @@ async def train_mode_callback(cq: CallbackQuery):
         await cq.answer()
         return
     actor = await resolve_actor(PG_POOL, cq.from_user.id)
-    if actor is None or actor.role != 'manager':
-        await cq.answer('Тренажёр предназначен для менеджеров.', show_alert=True)
+    if actor is None:
+        await cq.answer('Вы не привязаны к системе.', show_alert=True)
         return
     mode = cq.data.rsplit(':', 1)[1]
     if mode not in ('dialog', 'drill'):
@@ -221,7 +278,7 @@ async def voice_turn(message: Message):
     """Распознаём тем же Deepgram, что и реальные звонки — тренировка и работа
     проходят через один движок, а не через премиум-расшифровку Telegram,
     которой у ботов всё равно нет."""
-    actor = await _require_manager(message)
+    actor = await _require_employee(message)
     if actor is None:
         return
     session = await training_simulator.get_active_session(PG_POOL, actor)
@@ -242,7 +299,7 @@ async def voice_turn(message: Message):
 
 @router.message(F.text)
 async def text_turn(message: Message):
-    actor = await _require_manager(message)
+    actor = await _require_employee(message)
     if actor is None:
         return
     session = await training_simulator.get_active_session(PG_POOL, actor)

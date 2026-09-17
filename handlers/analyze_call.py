@@ -25,6 +25,7 @@ from crypto_util import decrypt
 from deepgram_client import transcribe_bytes
 from queue_runner import RetryLater, on_startup, register
 from reports import detail_button, fmt_call_time, render_short, send_short_report
+from tools import head_chat_ids
 
 log = logging.getLogger("callbot-astra-worker.analyze_call")
 
@@ -82,7 +83,7 @@ async def _head_immediate_count_today(pool: asyncpg.Pool, client: asyncpg.Record
 
 async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: asyncpg.Record,
                               short_report: dict, level: str | None) -> None:
-    if level != "❌❌":
+    if level != "❌":
         return
 
     call_time = fmt_call_time(call["call_started_at"], client["timezone"])
@@ -103,21 +104,27 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
             except Exception:
                 log.exception("не удалось отправить менеджеру, call id=%s", call["id"])
 
-    head = await pool.fetchrow("SELECT * FROM employees WHERE client_id=$1 AND role='head'", client["id"])
-    if head and head["telegram_user_id"]:
-        if await _head_immediate_count_today(pool, client) < client["max_immediate_per_head"]:
-            manager_name = (manager["full_name"] if manager else None) or f"доб. {call['extension']}"
+    # Руководителей может быть несколько — отправляем каждому, а не «первому,
+    # какой попадётся». Отметка immediate_sent_head одна на звонок: она про то,
+    # что звонок уже разослан руководству, а не про конкретного человека.
+    heads = await head_chat_ids(pool, client["id"])
+    if heads and await _head_immediate_count_today(pool, client) < client["max_immediate_per_head"]:
+        manager_name = (manager["full_name"] if manager else None) or f"доб. {call['extension']}"
+        text = render_short(short_report, level, call["duration_seconds"] or 0, manager_name, call_time=call_time)
+        if not (manager and manager["telegram_user_id"]):
+            text += (f"\n\n⚠️ Менеджер (доб. {call['extension']}) не подключён к боту — личный "
+                     f"разбор не отправлен.")
+        delivered = False
+        for chat_id in heads:
             try:
-                text = render_short(short_report, level, call["duration_seconds"] or 0, manager_name, call_time=call_time)
-                if not (manager and manager["telegram_user_id"]):
-                    text += (f"\n\n⚠️ Менеджер (доб. {call['extension']}) не подключён к боту — личный "
-                             f"разбор не отправлен.")
-                await send_short_report(_bot, head["telegram_user_id"], text, detail_button(call["id"], source="astra"))
-                await pool.execute(
-                    "UPDATE astra_analysis SET immediate_sent_head=true, updated_at=now() WHERE call_id=$1", call["id"]
-                )
+                await send_short_report(_bot, chat_id, text, detail_button(call["id"], source="astra"))
+                delivered = True
             except Exception:
-                log.exception("не удалось отправить РОПу, call id=%s", call["id"])
+                log.exception("не удалось отправить руководителю chat_id=%s, call id=%s", chat_id, call["id"])
+        if delivered:
+            await pool.execute(
+                "UPDATE astra_analysis SET immediate_sent_head=true, updated_at=now() WHERE call_id=$1", call["id"]
+            )
 
 
 @on_startup

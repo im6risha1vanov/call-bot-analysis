@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
@@ -238,7 +239,34 @@ async def worker(bot):
         try: await process(bot,job)
         finally: queue.task_done()
 
+async def _bind_by_username(message) -> str | None:
+    """Привязка сотрудника к чату по юзернейму. Числовой id Telegram отдаёт
+    боту только когда человек сам ему напишет, поэтому руководителя заводят
+    строкой с telegram_username, а id проставляется здесь, при первом /start.
+    Повторные /start ничего не меняют: условие telegram_user_id IS NULL."""
+    username = (message.from_user.username or '').lower()
+    if not username or PG_POOL is None:
+        return None
+    row = await PG_POOL.fetchrow(
+        'UPDATE employees SET telegram_user_id=$1 '
+        'WHERE lower(telegram_username)=$2 AND telegram_user_id IS NULL '
+        'RETURNING full_name, role',
+        message.from_user.id, username)
+    if row is None:
+        return None
+    log.info('привязан по юзернейму @%s: %s (%s)', username, row['full_name'], row['role'])
+    who = 'руководителя' if row['role'] == 'head' else 'менеджера'
+    return f'Узнал вас, {html.escape(row["full_name"] or username)} — вы подключены как {who}. Отчёты будут приходить сюда.'
+
+
 @router.message(CommandStart())
+async def start_command(message):
+    bound = await _bind_by_username(message)
+    if bound:
+        await message.answer(bound)
+    await help_command(message)
+
+
 @router.message(Command('help'))
 async def help_command(message):
     await message.answer(
@@ -248,6 +276,7 @@ async def help_command(message):
         '/stats — сводка по менеджерам\n'
         '/reset — очистить статистику этого чата\n'
         '/check &lt;критерий&gt; [дней] — что модель увидела по критерию (руководителю)\n'
+        '/trainings — последние тренировки, /training &lt;номер&gt; — одна подробно\n'
         '/approvals — задачи, ждущие подтверждения (руководителю)\n\n'
         'chat_id этого чата: <code>{}</code> (пригодится для HEAD_CHAT_ID в .env)'.format(message.chat.id),
         parse_mode='HTML')
@@ -512,6 +541,121 @@ async def check_command(message: Message):
     await send_chunks(message.bot, message.chat.id, _render_check(rows, key, title, days, client_tz))
 
 
+# ------------------------------------------------- просмотр тренировок
+
+TRAININGS_DEFAULT = 10
+
+
+def _training_result(row) -> str:
+    """Разговор мерится уровнем (той же линейкой, что и реальные звонки),
+    отработка возражений — долей зачтённых ответов: уровень звонка к набору
+    отговорок неприменим."""
+    if row['status'] == 'active':
+        return 'идёт'
+    if row['status'] != 'completed':
+        return row['status']
+    if row['mode'] == 'drill':
+        state = json.loads(row['drill_state']) if row['drill_state'] else {}
+        results = state.get('results') or []
+        return f"зачтено {sum(1 for r in results if r.get('passed'))} из {len(results)}"
+    return row['level'] or 'без оценки'
+
+
+@router.message(Command('trainings'))
+async def trainings_command(message: Message):
+    """Список тренировок. Руководитель видит весь отдел, менеджер — только свои
+    (права как везде: решает код по Actor, не текст запроса)."""
+    if PG_POOL is None:
+        return
+    actor = await resolve_actor(PG_POOL, message.from_user.id)
+    if actor is None:
+        return
+    args = (message.text or '').split()[1:]
+    requested_ext = args[0] if args else None
+    extension = actor.extension if actor.role == 'manager' else requested_ext
+
+    rows = await PG_POOL.fetch(
+        """
+        SELECT t.id, t.extension, t.mode, t.status, t.level, t.score, t.turns_count,
+               t.drill_state, t.started_at, t.is_test, e.full_name
+        FROM training_sessions t
+        LEFT JOIN employees e ON e.client_id = t.client_id AND e.extension = t.extension
+        WHERE t.client_id = $1 AND ($2::text IS NULL OR t.extension = $2)
+        ORDER BY t.started_at DESC LIMIT $3
+        """,
+        actor.client_id, extension, TRAININGS_DEFAULT,
+    )
+    if not rows:
+        await message.answer('Тренировок пока не было.')
+        return
+
+    client_tz = await PG_POOL.fetchval('SELECT timezone FROM clients WHERE id=$1', actor.client_id)
+    lines = ['<b>Последние тренировки</b>']
+    for r in rows:
+        who = r['full_name'] or (f"доб. {r['extension']}" if r['extension'] else 'руководитель')
+        when = fmt_call_time(r['started_at'], client_tz) or '—'
+        mode = 'возражения' if r['mode'] == 'drill' else 'разговор'
+        test = ' · пробная' if r['is_test'] else ''
+        lines.append(f"<b>#{r['id']}</b> · {html.escape(when)} · {html.escape(who)} · "
+                     f"{mode} · {html.escape(_training_result(r))}{test}")
+    lines.append('\nПодробности одной тренировки: <code>/training &lt;номер&gt;</code>')
+    await send_chunks(message.bot, message.chat.id, '\n'.join(lines))
+
+
+@router.message(Command('training'))
+async def training_detail_command(message: Message):
+    """Что именно отвечал человек и как это оценила модель — то, ради чего
+    руководителю и нужен просмотр: увидеть не только балл, но и основания."""
+    if PG_POOL is None:
+        return
+    actor = await resolve_actor(PG_POOL, message.from_user.id)
+    if actor is None:
+        return
+    args = (message.text or '').split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer('Использование: <code>/training &lt;номер&gt;</code> — номер из /trainings',
+                              parse_mode='HTML')
+        return
+
+    row = await PG_POOL.fetchrow(
+        """
+        SELECT t.*, e.full_name FROM training_sessions t
+        LEFT JOIN employees e ON e.client_id = t.client_id AND e.extension = t.extension
+        WHERE t.id = $1
+        """,
+        int(args[1]),
+    )
+    if row is None or row['client_id'] != actor.client_id:
+        await message.answer('Тренировка не найдена.')
+        return
+    if actor.role == 'manager' and row['extension'] != actor.extension:
+        await message.answer('Это тренировка другого сотрудника.')
+        return
+
+    client_tz = await PG_POOL.fetchval('SELECT timezone FROM clients WHERE id=$1', actor.client_id)
+    who = row['full_name'] or (f"доб. {row['extension']}" if row['extension'] else 'руководитель')
+    mode = 'отработка возражений' if row['mode'] == 'drill' else 'разговор целиком'
+    out = [f"<b>Тренировка #{row['id']}</b>",
+           f"{html.escape(who)} · {mode} · {html.escape(fmt_call_time(row['started_at'], client_tz) or '—')}",
+           f"Итог: {html.escape(_training_result(row))}"]
+    if row['is_test']:
+        out.append('<i>Пробная сессия руководителя — в статистику отдела не входит.</i>')
+
+    if row['mode'] == 'drill':
+        state = json.loads(row['drill_state']) if row['drill_state'] else {}
+        for i, r in enumerate((state.get('results') or []), 1):
+            mark = '✅' if r.get('passed') else '❌'
+            out.append(f"\n<b>{i}. Клиент:</b> {html.escape(r['objection'])}"
+                       f"\n<b>Ответ:</b> {html.escape(str(r['answer'])[:600])}"
+                       f"\n{mark} {html.escape(str(r.get('comment') or ''))}")
+    else:
+        for turn in json.loads(row['transcript']):
+            speaker = 'Клиент' if turn['role'] == 'client' else 'Менеджер'
+            out.append(f"\n<b>{speaker}:</b> {html.escape(str(turn['text'])[:600])}")
+
+    await send_chunks(message.bot, message.chat.id, '\n'.join(out))
+
+
 # --------------------------------------------------- очередь на подтверждение
 
 def _approval_keyboard(task_id: int) -> InlineKeyboardMarkup:
@@ -712,7 +856,12 @@ async def detail_callback(cq: CallbackQuery):
 
 async def main():
     global PG_POOL
-    init_db(); bot=Bot(BOT_TOKEN); dp=Dispatcher(); dp.include_router(router)
+    # Режим форматирования задаём один раз на бота: в aiogram 3.7+ его убрали
+    # из Bot(token, parse_mode=...) в DefaultBotProperties, и при обновлении
+    # библиотеки настройка потерялась — теги <b> стали уезжать в чат текстом.
+    # Динамические куски по всему файлу экранируются html.escape/esc.
+    init_db(); bot=Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
+    dp=Dispatcher(); dp.include_router(router)
     PG_POOL = await asyncpg.create_pool(os.environ['DATABASE_URL'], min_size=1, max_size=5)
     tasks=[asyncio.create_task(worker(bot)) for _ in range(int(os.getenv('WORKER_COUNT','2')))]
     try: await dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types())

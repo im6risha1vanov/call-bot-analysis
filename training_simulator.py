@@ -166,12 +166,20 @@ async def sessions_today(pool: asyncpg.Pool, client_id: int, extension: str, tz_
 
 
 async def get_active_session(pool: asyncpg.Pool, actor: Actor) -> asyncpg.Record | None:
-    if actor.role != "manager":
-        return None
+    """Руководителю тренажёр тоже доступен — чтобы он мог попробовать его сам и
+    решить, годится ли инструмент для отдела. Сессия привязывается к его
+    строке в employees, как и у менеджера."""
     return await pool.fetchrow(
         "SELECT * FROM training_sessions WHERE client_id=$1 AND extension=$2 AND status='active'",
-        actor.client_id, actor.extension,
+        actor.client_id, actor_key(actor),
     )
+
+
+def actor_key(actor: Actor) -> str:
+    """Чем помечена сессия. У менеджера это добавочный, у руководителя его нет
+    — берём то, что стоит в его строке employees (там оно уникально в паре с
+    клиентом)."""
+    return actor.extension or ""
 
 
 # ------------------------------------------------------------- сценарий
@@ -233,7 +241,7 @@ async def start_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
     лимиты — вызывающий код (demo_bot.py) обязан проверить get_active_session
     и sessions_today ДО вызова, чтобы дать пользователю понятное сообщение,
     а не проглатывать отказ здесь."""
-    scenario_kind, scenario = await pick_scenario(pool, actor.client_id, actor.extension, topic)
+    scenario_kind, scenario = await pick_scenario(pool, actor.client_id, actor_key(actor), topic)
     system_text = _system_prompt(scenario)
 
     resp = await claude.messages.create(
@@ -252,14 +260,16 @@ async def start_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
     row = await pool.fetchrow(
         """
         INSERT INTO training_sessions (client_id, extension, assigned_by, topic, scenario_kind,
-                                        transcript, turns_count, cost_usd)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, 1, $7)
+                                        transcript, turns_count, cost_usd, is_test)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, 1, $7, $8)
         RETURNING *
         """,
-        actor.client_id, actor.extension, assigned_by, topic, scenario_kind,
+        actor.client_id, actor_key(actor), assigned_by, topic, scenario_kind,
         json.dumps([{"role": "client", "text": opening}], ensure_ascii=False), cost,
+        actor.role == "head",
     )
-    log.info("training session id=%s начата, доб.=%s сценарий=%s", row["id"], actor.extension, scenario_kind)
+    log.info("training session id=%s начата, доб.=%s сценарий=%s пробная=%s",
+             row["id"], actor_key(actor), scenario_kind, actor.role == "head")
     return row
 
 
@@ -377,16 +387,17 @@ async def start_drill_session(pool: asyncpg.Pool, actor: Actor, topic: str | Non
     row = await pool.fetchrow(
         """
         INSERT INTO training_sessions (client_id, extension, assigned_by, topic, scenario_kind,
-                                        mode, transcript, drill_state, turns_count, cost_usd)
-        VALUES ($1, $2, $3, $4, 'brush_off_handled', 'drill', $5::jsonb, $6::jsonb, 1, 0)
+                                        mode, transcript, drill_state, turns_count, cost_usd, is_test)
+        VALUES ($1, $2, $3, $4, 'brush_off_handled', 'drill', $5::jsonb, $6::jsonb, 1, 0, $7)
         RETURNING *
         """,
-        actor.client_id, actor.extension, assigned_by, topic,
+        actor.client_id, actor_key(actor), assigned_by, topic,
         json.dumps([{"role": "client", "text": objections[0]}], ensure_ascii=False),
         json.dumps(drill_state, ensure_ascii=False),
+        actor.role == "head",
     )
-    log.info("drill session id=%s начата, доб.=%s возражений=%s",
-             row["id"], actor.extension, len(objections))
+    log.info("drill session id=%s начата, доб.=%s возражений=%s пробная=%s",
+             row["id"], actor_key(actor), len(objections), actor.role == "head")
     return row
 
 
@@ -475,6 +486,35 @@ async def _finalize_drill(pool: asyncpg.Pool, session_id: int, drill_state: dict
     if weak:
         tail = " Не зачтены: " + "; ".join(f"«{o}»" for o in weak[:3])
     return f"Отработка закончена: зачтено {passed} из {len(results)}.{tail}"
+
+
+async def end_session_early(pool: asyncpg.Pool, session: asyncpg.Record) -> tuple[str, str | None]:
+    """Досрочное завершение по кнопке. Возвращает (текст пользователю, уровень).
+
+    Оценивать то, что менеджер успел сказать, честнее, чем выбрасывать сессию:
+    прогресс считается по тому же правилу, что и всегда. Но если он не ответил
+    ни разу — оценивать нечего, помечаем сессию брошенной, чтобы она не портила
+    статистику нулём."""
+    if session["mode"] == "drill":
+        drill_state = json.loads(session["drill_state"])
+        if not drill_state.get("results"):
+            await pool.execute(
+                "UPDATE training_sessions SET status='abandoned', ended_at=now(), updated_at=now() WHERE id=$1",
+                session["id"],
+            )
+            return "Тренировка прервана — отвечать вы не начали, оценивать нечего.", None
+        return await _finalize_drill(pool, session["id"], drill_state), None
+
+    transcript: list[dict] = json.loads(session["transcript"])
+    if not any(t["role"] == "manager" for t in transcript):
+        await pool.execute(
+            "UPDATE training_sessions SET status='abandoned', ended_at=now(), updated_at=now() WHERE id=$1",
+            session["id"],
+        )
+        return "Тренировка прервана — отвечать вы не начали, оценивать нечего.", None
+
+    level = await _finalize(pool, session["id"], transcript)
+    return "Тренировка завершена досрочно, разбор посчитан по тому, что успели сказать.", level
 
 
 def _build_fake_transcript(transcript: list[dict]) -> str:
