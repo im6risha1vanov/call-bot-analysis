@@ -13,7 +13,6 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
-from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -36,13 +35,6 @@ DAILY_UNIT_LIMIT = float(os.getenv("MAX_COST_PER_CHAT_UNITS", "2000000"))
 _bot = Bot(token=os.environ["BOT_TOKEN"])
 
 
-def _day_bounds(client: asyncpg.Record) -> tuple[datetime, datetime]:
-    tz = ZoneInfo(client["timezone"])
-    day = datetime.now(tz).date()
-    start = datetime.combine(day, dtime.min, tzinfo=tz)
-    return start, start + timedelta(days=1)
-
-
 async def _over_daily_limit(pool: asyncpg.Pool, client: asyncpg.Record) -> bool:
     spent = await pool.fetchval(
         "SELECT spent_units FROM astra_daily_spend WHERE client_id=$1 AND day=$2",
@@ -58,16 +50,6 @@ async def _add_spend(pool: asyncpg.Pool, client: asyncpg.Record, units: float) -
         ON CONFLICT (client_id, day) DO UPDATE SET spent_units = astra_daily_spend.spent_units + EXCLUDED.spent_units
         """,
         client["id"], datetime.now(ZoneInfo(client["timezone"])).date(), units,
-    )
-
-
-async def _manager_immediate_count_today(pool: asyncpg.Pool, client: asyncpg.Record, extension: str) -> int:
-    start, end = _day_bounds(client)
-    return await pool.fetchval(
-        """SELECT count(*) FROM astra_analysis a JOIN calls c ON c.id = a.call_id
-           WHERE c.client_id=$1 AND c.extension=$2 AND a.immediate_sent_manager=true
-             AND a.updated_at >= $3 AND a.updated_at < $4""",
-        client["id"], extension, start, end,
     )
 
 
@@ -91,19 +73,20 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
         client["id"], call["extension"],
     )
 
-    # Менеджеру порядок доставки не меняли: по-прежнему только худший уровень и
-    # не больше max_immediate_per_manager в день. Менять это молча нельзя —
-    # человек начнёт получать в разы больше сообщений в рабочее время.
+    # Менеджеру уходят все его провальные звонки — суточного лимита нет: он был
+    # нужен, чтобы не заваливать человека в рабочее время, но пропущенный разбор
+    # своего же провала хуже лишнего сообщения. Порог уровня остаётся: ❌ — это
+    # то, где надо разбираться, ✅ и ⚠️ он видит в вечернем дайджесте.
     if manager and manager["telegram_user_id"] and level == "❌":
-        if await _manager_immediate_count_today(pool, client, call["extension"]) < client["max_immediate_per_manager"]:
-            try:
-                text = render_short(short_report, level, call["duration_seconds"] or 0, call_time=call_time)
-                await send_short_report(_bot, manager["telegram_user_id"], text, detail_button(call["id"], source="astra"))
-                await pool.execute(
-                    "UPDATE astra_analysis SET immediate_sent_manager=true, updated_at=now() WHERE call_id=$1", call["id"]
-                )
-            except Exception:
-                log.exception("не удалось отправить менеджеру, call id=%s", call["id"])
+        try:
+            text = render_short(short_report, level, call["duration_seconds"] or 0, call_time=call_time,
+                                 client_number=call["client_number"])
+            await send_short_report(_bot, manager["telegram_user_id"], text, detail_button(call["id"], source="astra"))
+            await pool.execute(
+                "UPDATE astra_analysis SET immediate_sent_manager=true, updated_at=now() WHERE call_id=$1", call["id"]
+            )
+        except Exception:
+            log.exception("не удалось отправить менеджеру, call id=%s", call["id"])
 
     # Руководителей может быть несколько — отправляем каждому, а не «первому,
     # какой попадётся». Отметка immediate_sent_head одна на звонок: она про то,
@@ -114,7 +97,8 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
     heads = await head_chat_ids(pool, client["id"])
     if heads:
         manager_name = (manager["full_name"] if manager else None) or f"доб. {call['extension']}"
-        text = render_short(short_report, level, call["duration_seconds"] or 0, manager_name, call_time=call_time)
+        text = render_short(short_report, level, call["duration_seconds"] or 0, manager_name, call_time=call_time,
+                             client_number=call["client_number"])
         if not (manager and manager["telegram_user_id"]):
             text += (f"\n\n⚠️ Менеджер (доб. {call['extension']}) не подключён к боту — личный "
                      f"разбор не отправлен.")
