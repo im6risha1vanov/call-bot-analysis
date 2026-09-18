@@ -527,14 +527,23 @@ async def maybe_send_digest_for_client(pool: asyncpg.Pool, client: asyncpg.Recor
 
     for ext in sorted({p["extension"] for p in pending if p["extension"]}):
         emp = by_ext.get(ext)
-        if not emp or not emp["telegram_user_id"]:
+        if not emp:
             continue
         text = await build_manager_digest(pool, client, ext, emp["full_name"] or ext, today_start, today_end)
-        if text:
+        if not text:
+            continue
+        # Копия каждого персонального дайджеста уходит руководителям и владельцу:
+        # им нужна не только сводка по отделу, но и то, что видит каждый человек.
+        # Имя менеджера есть в шапке дайджеста, так что копии различимы.
+        # Сам менеджер получает свой дайджест только если привязан к боту.
+        targets = list(heads)
+        if emp["telegram_user_id"]:
+            targets.insert(0, emp["telegram_user_id"])
+        for chat_id in targets:
             try:
-                await send_long(bot, emp["telegram_user_id"], text)
+                await send_long(bot, chat_id, text)
             except Exception:
-                log.exception("не удалось отправить дайджест менеджеру доб.=%s", ext)
+                log.exception("не удалось отправить дайджест доб.=%s, chat_id=%s", ext, chat_id)
 
     # Вечерний отчёт руководителю собирает агент (handlers/rop_digest.py):
     # точные числа считает код, а недочёты и что с ними делать — рассуждение.
