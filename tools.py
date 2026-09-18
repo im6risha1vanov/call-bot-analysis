@@ -40,10 +40,10 @@ class Actor:
     прислала модель."""
     telegram_user_id: int
     client_id: int
-    # head — руководитель отдела, ему идут отчёты по работе отдела.
-    # owner — владелец системы: технический отчёт о её работе, плюс те же права,
-    #   что у руководителя (он администрирует и проверяет систему), но бизнес-
-    #   отчёты ему в рабочее время не шлём — это не его инструмент.
+    # head — руководитель отдела.
+    # owner — владелец системы: получает всё то же, что руководитель, плюс
+    #   отдельный технический отчёт о работе самой системы. Права одинаковые.
+    # manager — менеджер: код сужает его до собственных звонков.
     role: Literal["head", "owner", "manager"]
     extension: str | None  # у head и owner добавочного нет
 
@@ -65,31 +65,21 @@ def is_privileged(actor: Actor) -> bool:
     return actor.role != "manager"
 
 
-async def head_chat_ids(pool: asyncpg.Pool, client_id: int) -> list[int]:
-    """Кому уходят отчёты по работе отдела. Раньше здесь стоял
-    fetchrow(... role='head') — то есть одному, а какому именно, решал порядок
-    строк; с появлением второго руководителя это значило бы «кому повезёт».
+async def report_chat_ids(pool: asyncpg.Pool, client_id: int) -> list[int]:
+    """Кому уходят отчёты по отделу: разборы звонков, дайджесты, планёрка,
+    сводки, сообщения о сбоях. Это руководители И владелец системы — владелец
+    получает всё то же, что руководитель, плюс отдельный технический отчёт.
 
-    Владелец системы (owner) в эту рассылку не входит: ему идёт технический
-    отчёт, а не разбор звонков. Исключение — если ни один руководитель к боту не
-    привязан: тогда отчёты уходят владельцу, иначе они потерялись бы молча, а
-    тихие потери в этой системе уже обходились сутками простоя."""
+    Раньше здесь стоял fetchrow(... role=head) — то есть одному, а какому
+    именно, решал порядок строк; с появлением второго получателя это значило бы
+    «кому повезёт»."""
     rows = await pool.fetch(
         "SELECT telegram_user_id FROM employees "
-        "WHERE client_id=$1 AND role='head' AND telegram_user_id IS NOT NULL ORDER BY id",
+        "WHERE client_id=$1 AND role IN ('head', 'owner') AND telegram_user_id IS NOT NULL "
+        "ORDER BY id",
         client_id,
     )
-    if rows:
-        return [r["telegram_user_id"] for r in rows]
-
-    fallback = await pool.fetch(
-        "SELECT telegram_user_id FROM employees "
-        "WHERE client_id=$1 AND role='owner' AND telegram_user_id IS NOT NULL ORDER BY id",
-        client_id,
-    )
-    if fallback:
-        log.warning("ни один руководитель не привязан к боту — отчёты отдела уходят владельцу системы")
-    return [r["telegram_user_id"] for r in fallback]
+    return [r["telegram_user_id"] for r in rows]
 
 
 async def owner_chat_ids(pool: asyncpg.Pool, client_id: int) -> list[int]:

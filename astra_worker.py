@@ -30,9 +30,10 @@ import asyncpg
 from aiogram import Bot
 
 import mango_client
+from analysis import CRITERIA
 from crypto_util import decrypt
 from reports import esc, send_long
-from tools import head_chat_ids
+from tools import owner_chat_ids, report_chat_ids
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("callbot-astra-worker")
@@ -55,6 +56,8 @@ def _day_bounds(client: asyncpg.Record, offset_days: int = 0) -> tuple[datetime,
     day = datetime.now(tz).date() + timedelta(days=offset_days)
     start = datetime.combine(day, dtime.min, tzinfo=tz)
     return start, start + timedelta(days=1)
+
+
 
 
 # -------------------------------------------------------------------- опрос
@@ -190,12 +193,16 @@ _last_error_notice: dict[int, float] = {}
 
 
 async def _send_poll_error(pool: asyncpg.Pool, client: asyncpg.Record, error: str) -> None:
-    """Не чаще раза в час на клиента: при опросе каждые 5 минут устойчивая
+    """Уходит только владельцу системы: сломанный опрос Mango — это про
+    работу системы, а не про работу отдела, и руководителю с этим делать
+    нечего. Не чаще раза в час на клиента: при опросе каждые 5 минут устойчивая
     поломка иначе завалила бы чат одинаковыми сообщениями."""
     now = time.monotonic()
     if now - _last_error_notice.get(client["id"], 0) < ERROR_NOTICE_COOLDOWN_SEC:
         return
-    chat_ids = await head_chat_ids(pool, client["id"])
+    # Если владелец не привязан к боту — лучше сказать хоть кому-то, чем
+    # промолчать: именно из-за молчания опрос однажды простоял сутки.
+    chat_ids = await owner_chat_ids(pool, client["id"]) or await report_chat_ids(pool, client["id"])
     if not chat_ids:
         return
     _last_error_notice[client["id"]] = now
@@ -345,6 +352,18 @@ async def maybe_enqueue_rop_digests(pool: asyncpg.Pool) -> None:
 
 LEVELS = ("✅", "⚠️", "❌")
 
+CRITERION_BUCKET = {
+    "call_reason": "скрипт", "gatekeeper_passed": "скрипт",
+    "implication_questions": "менеджер", "problem_over_situational": "менеджер", "explicit_need": "менеджер",
+    "decision_influence": "менеджер", "brush_off_handled": "менеджер", "sold_meeting": "менеджер",
+    "concrete_commitment": "менеджер", "no_early_pitch": "менеджер", "insight": "менеджер", "talk_share": "менеджер",
+}
+BUCKET_HINT = {
+    "менеджер": "похоже, дело в технике самого разговора — стоит потренировать этот момент отдельно",
+    "скрипт": "похоже, дело в самой структуре звонка (повод, выход на нужного человека) — стоит пересмотреть сценарий",
+}
+
+
 def _unrated(rows) -> int:
     """Звонки без вердикта: модель пометила их как оборванные — слишком
     короткие, рваные или вообще автоответчик («Вас приветствует компания…»),
@@ -412,6 +431,72 @@ async def build_manager_digest(pool: asyncpg.Pool, client: asyncpg.Record, exten
     return "\n".join(out)
 
 
+async def build_head_digest(pool: asyncpg.Pool, client: asyncpg.Record,
+                             today_start: datetime, today_end: datetime) -> str | None:
+    rows = await pool.fetch(
+        """SELECT c.extension, a.level, a.short_report, a.analysis FROM astra_analysis a
+           JOIN calls c ON c.id = a.call_id
+           WHERE c.client_id=$1 AND a.status='analyzed'
+             AND a.updated_at >= $2 AND a.updated_at < $3""",
+        client["id"], today_start, today_end,
+    )
+    if not rows:
+        return None
+    employees = await pool.fetch(
+        "SELECT extension, full_name, telegram_user_id FROM employees WHERE client_id=$1 AND role='manager'",
+        client["id"],
+    )
+    names = {e["extension"]: e["full_name"] for e in employees}
+    linked = {e["extension"] for e in employees if e["telegram_user_id"]}
+
+    per_manager: dict[str, list] = {}
+    fail_count: dict[str, int] = {}
+    total_count: dict[str, int] = {}
+    for r in rows:
+        per_manager.setdefault(r["extension"], []).append(r)
+        if not r["analysis"]:
+            continue
+        for row in (json.loads(r["analysis"]).get("rows") or []):
+            if not row.get("applicable"):
+                continue
+            total_count[row["title"]] = total_count.get(row["title"], 0) + 1
+            if not row.get("passed"):
+                fail_count[row["title"]] = fail_count.get(row["title"], 0) + 1
+
+    def _share(ext_rows):
+        c = _level_counts(ext_rows)
+        n = len(ext_rows)
+        return c["✅"] / n, c["❌"] / n
+
+    ranking = sorted(per_manager.items(), key=lambda kv: (-_share(kv[1])[0], _share(kv[1])[1]))
+    unrated = _unrated(rows)
+    header = f"Всего звонков разобрано: {len(rows)}"
+    if unrated:
+        header += (f", из них {unrated} без оценки — оборванные или автоответчик, "
+                   f"судить там не по чему")
+    out = ["<b>📊 Дайджест РОПу за день</b>", header]
+    for ext, ext_rows in ranking:
+        c = _level_counts(ext_rows)
+        out.append(f"• {esc(names.get(ext) or ext)} — {_fmt_levels(ext_rows)}")
+        worst = next((r for r in ext_rows if r["level"] in ("⚠️", "❌")), None)
+        line = _one_liner(worst["short_report"]) if worst else None
+        if line:
+            out.append(f"   Худший звонок: {line}")
+        if ext not in linked:
+            out.append(f"   ⚠️ Не подключён к боту — /invite {esc(ext)}")
+
+    if fail_count:
+        title, n = max(fail_count.items(), key=lambda kv: kv[1])
+        key = next((k for k, _w, t in CRITERIA if t == title), None)
+        bucket = CRITERION_BUCKET.get(key)
+        hint = BUCKET_HINT.get(bucket, "стоит присмотреться к этому месту в звонках отдельно")
+        out += ["", "<b>В ЧЁМ МОЖЕТ БЫТЬ ДЕЛО</b>",
+                f"Чаще всего проваливается «{esc(title)}» ({n} из {total_count[title]} звонков, где критерий "
+                f"был применим) — {hint}. Возможно, дело и в другом, это не точный вывод."]
+
+    return "\n".join(out)
+
+
 async def maybe_send_digest_for_client(pool: asyncpg.Pool, client: asyncpg.Record) -> None:
     tz = ZoneInfo(client["timezone"])
     now_local = datetime.now(tz)
@@ -438,7 +523,7 @@ async def maybe_send_digest_for_client(pool: asyncpg.Pool, client: asyncpg.Recor
 
     employees = await pool.fetch("SELECT * FROM employees WHERE client_id=$1", client["id"])
     by_ext = {e["extension"]: e for e in employees if e["role"] == "manager"}
-    heads = await head_chat_ids(pool, client["id"])
+    heads = await report_chat_ids(pool, client["id"])
 
     for ext in sorted({p["extension"] for p in pending if p["extension"]}):
         emp = by_ext.get(ext)

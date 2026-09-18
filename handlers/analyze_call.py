@@ -24,7 +24,7 @@ from crypto_util import decrypt
 from deepgram_client import transcribe_bytes
 from queue_runner import RetryLater, on_startup, register
 from reports import detail_button, fmt_call_time, render_short, send_short_report
-from tools import head_chat_ids
+from tools import report_chat_ids
 
 log = logging.getLogger("callbot-astra-worker.analyze_call")
 
@@ -88,14 +88,14 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
         except Exception:
             log.exception("не удалось отправить менеджеру, call id=%s", call["id"])
 
-    # Руководителей может быть несколько — отправляем каждому, а не «первому,
-    # какой попадётся». Отметка immediate_sent_head одна на звонок: она про то,
+    # Получателей несколько: все руководители и владелец системы — отправляем
+    # каждому, а не «первому, какой попадётся». Отметка immediate_sent_head одна на звонок: она про то,
     # что звонок уже разослан руководству, а не про конкретного человека.
     # Суточного лимита у руководителя больше нет: он был нужен, когда приходили
     # только провалы и важно было не завалить чат. Теперь задача обратная —
     # видеть все звонки за день.
-    heads = await head_chat_ids(pool, client["id"])
-    if heads:
+    recipients = await report_chat_ids(pool, client["id"])
+    if recipients:
         manager_name = (manager["full_name"] if manager else None) or f"доб. {call['extension']}"
         text = render_short(short_report, level, call["duration_seconds"] or 0, manager_name, call_time=call_time,
                              client_number=call["client_number"])
@@ -103,7 +103,7 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
             text += (f"\n\n⚠️ Менеджер (доб. {call['extension']}) не подключён к боту — личный "
                      f"разбор не отправлен.")
         delivered = False
-        for chat_id in heads:
+        for chat_id in recipients:
             try:
                 await send_short_report(_bot, chat_id, text, detail_button(call["id"], source="astra"))
                 delivered = True

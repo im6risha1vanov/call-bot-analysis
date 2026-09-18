@@ -8,16 +8,15 @@
 же rop_agent.answer(), что и живые вопросы в Telegram (единая логика, единая
 проверка выборки и единый проверяющий проход).
 
-Нет отдельной роли "владелец бизнеса" в employees (только head|manager) —
-месячный отчёт уходит РОПу (head), как и остальные. Если собственник — другой
-человек, это отдельная задача (завести роль/telegram_id), не изобретаю её
-здесь.
+Получатели — руководители отдела и владелец системы (role in head, owner).
+Отдельной роли "владелец бизнеса" в employees нет: если месячный отчёт должен
+уходить кому-то ещё, это отдельная задача — завести роль и привязку.
 """
 
 import json
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
@@ -26,7 +25,7 @@ from aiogram import Bot
 
 import rop_agent
 from queue_runner import register
-from tools import Actor, head_chat_ids
+from tools import Actor, report_chat_ids
 
 log = logging.getLogger("callbot-astra-worker.rop_digest")
 
@@ -34,17 +33,17 @@ _bot = Bot(token=os.environ["BOT_TOKEN"])
 
 
 async def _head_actors(pool: asyncpg.Pool, client_id: int) -> list[Actor]:
-    """Отчёт уходит каждому руководителю. Ответ агента считаем один раз (по
-    первому из них) — данные и права у руководителей одинаковые, а платить за
-    один и тот же отчёт дважды незачем."""
+    """Отчёт уходит каждому получателю: руководителям отдела и владельцу
+    системы. Ответ агента считаем один раз (по первому из них) — данные и права
+    у них одинаковые, а платить за один и тот же отчёт дважды незачем."""
     return [
         Actor(telegram_user_id=chat_id, client_id=client_id, role="head", extension=None)
-        for chat_id in await head_chat_ids(pool, client_id)
+        for chat_id in await report_chat_ids(pool, client_id)
     ]
 
 
 async def _broadcast(actors: list[Actor], header: str, text: str) -> int:
-    """Сбой доставки одному руководителю не должен лишать отчёта остальных."""
+    """Сбой доставки одному получателю не должен лишать отчёта остальных."""
     sent = 0
     for actor in actors:
         try:
@@ -87,7 +86,7 @@ async def rop_digest_morning(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
     client_id = json.loads(task["input"])["client_id"]
     actors = await _head_actors(pool, client_id)
     if not actors:
-        return {"skipped": "ни один руководитель не привязан к боту"}
+        return {"skipped": "некому отправить: ни один получатель не привязан к боту"}
     period = _period_yesterday(await _client_tz(pool, client_id))
     question = (
         f"Сформируй три темы для утренней планёрки на основе вчерашних звонков "
@@ -106,7 +105,7 @@ async def rop_digest_weekly(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
     client_id = json.loads(task["input"])["client_id"]
     actors = await _head_actors(pool, client_id)
     if not actors:
-        return {"skipped": "ни один руководитель не привязан к боту"}
+        return {"skipped": "некому отправить: ни один получатель не привязан к боту"}
     tz = await _client_tz(pool, client_id)
     last_week, week_before = _period_week(tz, 1), _period_week(tz, 2)
     question = (
@@ -125,7 +124,7 @@ async def rop_digest_monthly(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
     client_id = json.loads(task["input"])["client_id"]
     actors = await _head_actors(pool, client_id)
     if not actors:
-        return {"skipped": "ни один руководитель не привязан к боту"}
+        return {"skipped": "некому отправить: ни один получатель не привязан к боту"}
     period = _period_prev_month(await _client_tz(pool, client_id))
     question = (
         f"Составь отчёт о прошедшем месяце ({period['start']}–{period['end']}) языком выручки и "
@@ -205,14 +204,10 @@ async def rop_digest_evening(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
     client_id = json.loads(task["input"])["client_id"]
     actors = await _head_actors(pool, client_id)
     if not actors:
-        return {"skipped": "ни один руководитель не привязан к боту"}
+        return {"skipped": "некому отправить: ни один получатель не привязан к боту"}
 
     tz = await _client_tz(pool, client_id)
-    # day в задаче — необязательный: планировщик его не ставит (отчёт за
-    # сегодня), но он позволяет перегенерировать отчёт за прошедший день.
-    payload = json.loads(task["input"])
-    day = (date.fromisoformat(payload["day"]) if payload.get("day")
-           else datetime.now(ZoneInfo(tz)).date())
+    day = datetime.now(ZoneInfo(tz)).date()
     day_start = datetime.combine(day, dtime.min, tzinfo=ZoneInfo(tz))
     day_end = day_start + timedelta(days=1)
 
