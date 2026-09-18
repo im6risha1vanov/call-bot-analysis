@@ -30,7 +30,6 @@ import asyncpg
 from aiogram import Bot
 
 import mango_client
-from analysis import CRITERIA
 from crypto_util import decrypt
 from reports import esc, send_long
 from tools import head_chat_ids
@@ -56,8 +55,6 @@ def _day_bounds(client: asyncpg.Record, offset_days: int = 0) -> tuple[datetime,
     day = datetime.now(tz).date() + timedelta(days=offset_days)
     start = datetime.combine(day, dtime.min, tzinfo=tz)
     return start, start + timedelta(days=1)
-
-
 
 
 # -------------------------------------------------------------------- опрос
@@ -348,18 +345,6 @@ async def maybe_enqueue_rop_digests(pool: asyncpg.Pool) -> None:
 
 LEVELS = ("✅", "⚠️", "❌")
 
-CRITERION_BUCKET = {
-    "call_reason": "скрипт", "gatekeeper_passed": "скрипт",
-    "implication_questions": "менеджер", "problem_over_situational": "менеджер", "explicit_need": "менеджер",
-    "decision_influence": "менеджер", "brush_off_handled": "менеджер", "sold_meeting": "менеджер",
-    "concrete_commitment": "менеджер", "no_early_pitch": "менеджер", "insight": "менеджер", "talk_share": "менеджер",
-}
-BUCKET_HINT = {
-    "менеджер": "похоже, дело в технике самого разговора — стоит потренировать этот момент отдельно",
-    "скрипт": "похоже, дело в самой структуре звонка (повод, выход на нужного человека) — стоит пересмотреть сценарий",
-}
-
-
 def _unrated(rows) -> int:
     """Звонки без вердикта: модель пометила их как оборванные — слишком
     короткие, рваные или вообще автоответчик («Вас приветствует компания…»),
@@ -407,9 +392,13 @@ async def build_manager_digest(pool: asyncpg.Pool, client: asyncpg.Record, exten
            ORDER BY a.updated_at""",
         client["id"], extension, today_start, today_end,
     )
+    # Звонки без вердикта (оборванные, автоответчики) в дайджест менеджеру не
+    # входят вообще — ни в счёт, ни отдельной строкой: ему важна своя работа, а
+    # там работы не было. Руководителю они по-прежнему видны цифрой «без
+    # оценки»: ему нужно понимать, сколько времени отдел потратил впустую.
+    rows = [r for r in rows if r["level"]]
     if not rows:
         return None
-    counts = _level_counts(rows)
     out = [
         f"<b>📊 Дайджест за день</b> · {esc(name)}",
         f"Звонков: {len(rows)} — {_fmt_levels(rows)}",
@@ -420,72 +409,6 @@ async def build_manager_digest(pool: asyncpg.Pool, client: asyncpg.Record, exten
         line = _one_liner(worst["short_report"])
         if line:
             out += ["", "<b>Худший звонок сегодня</b>", line]
-    return "\n".join(out)
-
-
-async def build_head_digest(pool: asyncpg.Pool, client: asyncpg.Record,
-                             today_start: datetime, today_end: datetime) -> str | None:
-    rows = await pool.fetch(
-        """SELECT c.extension, a.level, a.short_report, a.analysis FROM astra_analysis a
-           JOIN calls c ON c.id = a.call_id
-           WHERE c.client_id=$1 AND a.status='analyzed'
-             AND a.updated_at >= $2 AND a.updated_at < $3""",
-        client["id"], today_start, today_end,
-    )
-    if not rows:
-        return None
-    employees = await pool.fetch(
-        "SELECT extension, full_name, telegram_user_id FROM employees WHERE client_id=$1 AND role='manager'",
-        client["id"],
-    )
-    names = {e["extension"]: e["full_name"] for e in employees}
-    linked = {e["extension"] for e in employees if e["telegram_user_id"]}
-
-    per_manager: dict[str, list] = {}
-    fail_count: dict[str, int] = {}
-    total_count: dict[str, int] = {}
-    for r in rows:
-        per_manager.setdefault(r["extension"], []).append(r)
-        if not r["analysis"]:
-            continue
-        for row in (json.loads(r["analysis"]).get("rows") or []):
-            if not row.get("applicable"):
-                continue
-            total_count[row["title"]] = total_count.get(row["title"], 0) + 1
-            if not row.get("passed"):
-                fail_count[row["title"]] = fail_count.get(row["title"], 0) + 1
-
-    def _share(ext_rows):
-        c = _level_counts(ext_rows)
-        n = len(ext_rows)
-        return c["✅"] / n, c["❌"] / n
-
-    ranking = sorted(per_manager.items(), key=lambda kv: (-_share(kv[1])[0], _share(kv[1])[1]))
-    unrated = _unrated(rows)
-    header = f"Всего звонков разобрано: {len(rows)}"
-    if unrated:
-        header += (f", из них {unrated} без оценки — оборванные или автоответчик, "
-                   f"судить там не по чему")
-    out = ["<b>📊 Дайджест РОПу за день</b>", header]
-    for ext, ext_rows in ranking:
-        c = _level_counts(ext_rows)
-        out.append(f"• {esc(names.get(ext) or ext)} — {_fmt_levels(ext_rows)}")
-        worst = next((r for r in ext_rows if r["level"] in ("⚠️", "❌")), None)
-        line = _one_liner(worst["short_report"]) if worst else None
-        if line:
-            out.append(f"   Худший звонок: {line}")
-        if ext not in linked:
-            out.append(f"   ⚠️ Не подключён к боту — /invite {esc(ext)}")
-
-    if fail_count:
-        title, n = max(fail_count.items(), key=lambda kv: kv[1])
-        key = next((k for k, _w, t in CRITERIA if t == title), None)
-        bucket = CRITERION_BUCKET.get(key)
-        hint = BUCKET_HINT.get(bucket, "стоит присмотреться к этому месту в звонках отдельно")
-        out += ["", "<b>В ЧЁМ МОЖЕТ БЫТЬ ДЕЛО</b>",
-                f"Чаще всего проваливается «{esc(title)}» ({n} из {total_count[title]} звонков, где критерий "
-                f"был применим) — {hint}. Возможно, дело и в другом, это не точный вывод."]
-
     return "\n".join(out)
 
 
@@ -528,14 +451,21 @@ async def maybe_send_digest_for_client(pool: asyncpg.Pool, client: asyncpg.Recor
             except Exception:
                 log.exception("не удалось отправить дайджест менеджеру доб.=%s", ext)
 
+    # Вечерний отчёт руководителю собирает агент (handlers/rop_digest.py):
+    # точные числа считает код, а недочёты и что с ними делать — рассуждение.
+    # Здесь только ставим задачу в очередь: планировщик и исполнитель не
+    # общаются напрямую, только через таблицу tasks.
     if heads:
-        text = await build_head_digest(pool, client, today_start, today_end)
-        if text:
-            for chat_id in heads:
-                try:
-                    await send_long(bot, chat_id, text)
-                except Exception:
-                    log.exception("не удалось отправить вечерний дайджест руководителю, chat_id=%s", chat_id)
+        await pool.execute(
+            """
+            INSERT INTO tasks (type, client_id, input, dedup_key)
+            VALUES ('rop_digest_evening', $1, $2::jsonb, $3)
+            ON CONFLICT (type, dedup_key) DO NOTHING
+            """,
+            client["id"], json.dumps({"client_id": client["id"]}),
+            f"evening:{client['id']}:{now_local.date().isoformat()}",
+        )
+        log.info("client id=%s поставлена задача rop_digest_evening", client["id"])
 
     await pool.execute(
         """UPDATE astra_analysis a SET digest_included=true, updated_at=now()

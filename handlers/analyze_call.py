@@ -71,19 +71,17 @@ async def _manager_immediate_count_today(pool: asyncpg.Pool, client: asyncpg.Rec
     )
 
 
-async def _head_immediate_count_today(pool: asyncpg.Pool, client: asyncpg.Record) -> int:
-    start, end = _day_bounds(client)
-    return await pool.fetchval(
-        """SELECT count(*) FROM astra_analysis a JOIN calls c ON c.id = a.call_id
-           WHERE c.client_id=$1 AND a.immediate_sent_head=true
-             AND a.updated_at >= $2 AND a.updated_at < $3""",
-        client["id"], start, end,
-    )
-
-
 async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: asyncpg.Record,
                               short_report: dict, level: str | None) -> None:
-    if level != "❌":
+    # Руководителю уходит разбор КАЖДОГО звонка, а не только провального:
+    # раньше порог вердикта решал, что он увидит, и половина работы отдела была
+    # ему не видна.
+    #
+    # Исключение — звонки без вердикта: модель помечает их оборванными
+    # (слишком короткие, рваные или автоответчик вида «Вас приветствует
+    # компания…»). Разбирать там нечего, а в чат это летело бы мусором. Их
+    # число видно отдельной цифрой «без оценки» в вечернем дайджесте.
+    if level is None:
         return
 
     call_time = fmt_call_time(call["call_started_at"], client["timezone"])
@@ -93,7 +91,10 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
         client["id"], call["extension"],
     )
 
-    if manager and manager["telegram_user_id"]:
+    # Менеджеру порядок доставки не меняли: по-прежнему только худший уровень и
+    # не больше max_immediate_per_manager в день. Менять это молча нельзя —
+    # человек начнёт получать в разы больше сообщений в рабочее время.
+    if manager and manager["telegram_user_id"] and level == "❌":
         if await _manager_immediate_count_today(pool, client, call["extension"]) < client["max_immediate_per_manager"]:
             try:
                 text = render_short(short_report, level, call["duration_seconds"] or 0, call_time=call_time)
@@ -107,8 +108,11 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
     # Руководителей может быть несколько — отправляем каждому, а не «первому,
     # какой попадётся». Отметка immediate_sent_head одна на звонок: она про то,
     # что звонок уже разослан руководству, а не про конкретного человека.
+    # Суточного лимита у руководителя больше нет: он был нужен, когда приходили
+    # только провалы и важно было не завалить чат. Теперь задача обратная —
+    # видеть все звонки за день.
     heads = await head_chat_ids(pool, client["id"])
-    if heads and await _head_immediate_count_today(pool, client) < client["max_immediate_per_head"]:
+    if heads:
         manager_name = (manager["full_name"] if manager else None) or f"доб. {call['extension']}"
         text = render_short(short_report, level, call["duration_seconds"] or 0, manager_name, call_time=call_time)
         if not (manager and manager["telegram_user_id"]):

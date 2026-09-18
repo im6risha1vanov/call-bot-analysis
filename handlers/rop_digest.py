@@ -17,7 +17,7 @@
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
@@ -138,3 +138,111 @@ async def rop_digest_monthly(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
     text = await rop_agent.answer(pool, actors[0], question)
     sent = await _broadcast(actors, "📈 Отчёт за месяц", text)
     return {"client_id": client_id, "chars": len(text), "sent_to": sent}
+
+
+# ------------------------------------------------- вечерний дайджест РОПу
+#
+# Структура задана пользователем: 1) общая статистика по каждому менеджеру,
+# 2) общие недочёты по отделу, 3) недочёты персональные, 4) отработка
+# недочётов.
+#
+# Пункт 1 считает код: это точные числа, и модель к ним не подпускается —
+# тот же принцип, что и с баллами. Пункты 2-4 — рассуждение, их собирает
+# агент РОПа по тем же инструментам и с тем же правилом выборки.
+
+
+async def _daily_stats(pool: asyncpg.Pool, client_id: int, day_start, day_end) -> list[dict]:
+    """Всего звонков — абсолютно все за день, а не только разобранные: отбор
+    отсеивает короткие и без записи, и руководителю важно видеть полную
+    активность человека, а не долю, до которой добрался разбор."""
+    rows = await pool.fetch(
+        """
+        SELECT c.extension,
+               count(*) AS total,
+               count(a.call_id) FILTER (WHERE a.status = 'analyzed') AS analyzed,
+               count(*) FILTER (WHERE a.level = '✅') AS ok,
+               count(*) FILTER (WHERE a.level = '⚠️') AS warn,
+               count(*) FILTER (WHERE a.level = '❌') AS bad,
+               count(*) FILTER (WHERE a.status = 'analyzed' AND a.level IS NULL) AS unrated
+        FROM calls c
+        LEFT JOIN astra_analysis a ON a.call_id = c.id
+        WHERE c.client_id = $1 AND c.call_started_at >= $2 AND c.call_started_at < $3
+          AND (c.raw_summary->>'context_type')::int = 2
+        GROUP BY c.extension
+        ORDER BY count(*) DESC
+        """,
+        client_id, day_start, day_end,
+    )
+    employees = await pool.fetch(
+        "SELECT extension, full_name FROM employees WHERE client_id=$1 AND role='manager'", client_id)
+    names = {e["extension"]: e["full_name"] for e in employees}
+    return [
+        {
+            "manager": names.get(r["extension"]) or f"доб. {r['extension']}",
+            "extension": r["extension"],
+            "total": r["total"], "analyzed": r["analyzed"],
+            "success": r["ok"], "warn": r["warn"], "failed": r["bad"], "unrated": r["unrated"],
+        }
+        for r in rows
+    ]
+
+
+def _render_stats(stats: list[dict]) -> str:
+    out = ["<b>1. Статистика по менеджерам</b>"]
+    for s in stats:
+        out.append(
+            f"• {s['manager']} — всего звонков {s['total']}, разобрано {s['analyzed']}: "
+            f"✅ {s['success']} · ⚠️ {s['warn']} · ❌ {s['failed']}"
+            + (f" · без оценки {s['unrated']}" if s["unrated"] else "")
+        )
+    out.append("<i>«Всего» — все исходящие звонки за день. В разбор идут те, что прошли "
+               "отбор по длительности и с записью; «без оценки» — оборванные и автоответчики.</i>")
+    return "\n".join(out)
+
+
+@register("rop_digest_evening")
+async def rop_digest_evening(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
+    client_id = json.loads(task["input"])["client_id"]
+    actors = await _head_actors(pool, client_id)
+    if not actors:
+        return {"skipped": "ни один руководитель не привязан к боту"}
+
+    tz = await _client_tz(pool, client_id)
+    # day в задаче — необязательный: планировщик его не ставит (отчёт за
+    # сегодня), но он позволяет перегенерировать отчёт за прошедший день.
+    payload = json.loads(task["input"])
+    day = (date.fromisoformat(payload["day"]) if payload.get("day")
+           else datetime.now(ZoneInfo(tz)).date())
+    day_start = datetime.combine(day, dtime.min, tzinfo=ZoneInfo(tz))
+    day_end = day_start + timedelta(days=1)
+
+    stats = await _daily_stats(pool, client_id, day_start, day_end)
+    if not stats:
+        return {"skipped": "за день не было исходящих звонков"}
+
+    period = {"start": day.isoformat(), "end": (day + timedelta(days=1)).isoformat()}
+    question = (
+        f"Собери вечерний отчёт за сегодня ({period['start']}) по трём разделам. Статистику "
+        f"по менеджерам НЕ пиши — она уже посчитана кодом и будет добавлена перед твоим "
+        f"текстом. Вот она, для опоры: {json.dumps(stats, ensure_ascii=False)}\n\n"
+        f"Разделы, ровно в таком порядке и с такими заголовками:\n"
+        f"2. Общие недочёты по отделу — что проваливается у всех или у большинства. "
+        f"Используй get_criteria_breakdown по отделу за период "
+        f"{period['start']}–{period['end']} (manager_extension не указывай). Схлопывай "
+        f"связанные критерии в одну тему: если провалы вытекают один из другого, это одна "
+        f"проблема, а не три.\n"
+        f"3. Недочёты персональные — по каждому менеджеру, у кого есть чем отличиться от "
+        f"остальных. Приводи ФАКТЫ (сколько из скольких, цитата из звонка через find_calls "
+        f"или get_call), а оценочные суждения — только через verify_conclusion. Если у "
+        f"человека данных на оценку мало, так и напиши, но факт приведи.\n"
+        f"4. Отработка недочётов — что конкретно делать завтра. Для тренировки в тренажёре "
+        f"указывай команду вида «/assign_train <добавочный> возражения» (отработка возражений "
+        f"поштучно) или «/assign_train <добавочный> разговор» (звонок целиком). Если недочёт "
+        f"общий — предложи разбор на планёрке с конкретными номерами звонков.\n\n"
+        f"Без вступлений и без пересказа статистики. Заголовки разделов — обычным текстом "
+        f"с номером, как указано выше."
+    )
+    text = await rop_agent.answer(pool, actors[0], question)
+    body = f"{_render_stats(stats)}\n\n{text}"
+    sent = await _broadcast(actors, "📊 Вечерний отчёт по отделу", body)
+    return {"client_id": client_id, "managers": len(stats), "chars": len(body), "sent_to": sent}
