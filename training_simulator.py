@@ -266,10 +266,10 @@ async def start_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
         """,
         actor.client_id, actor_key(actor), assigned_by, topic, scenario_kind,
         json.dumps([{"role": "client", "text": opening}], ensure_ascii=False), cost,
-        actor.role == "head",
+        actor.role != "manager",  # пробная сессия: руководитель или владелец пробует тренажёр
     )
     log.info("training session id=%s начата, доб.=%s сценарий=%s пробная=%s",
-             row["id"], actor_key(actor), scenario_kind, actor.role == "head")
+             row["id"], actor_key(actor), scenario_kind, actor.role != "manager")
     return row
 
 
@@ -394,10 +394,10 @@ async def start_drill_session(pool: asyncpg.Pool, actor: Actor, topic: str | Non
         actor.client_id, actor_key(actor), assigned_by, topic,
         json.dumps([{"role": "client", "text": objections[0]}], ensure_ascii=False),
         json.dumps(drill_state, ensure_ascii=False),
-        actor.role == "head",
+        actor.role != "manager",  # пробная сессия: руководитель или владелец пробует тренажёр
     )
     log.info("drill session id=%s начата, доб.=%s возражений=%s пробная=%s",
-             row["id"], actor_key(actor), len(objections), actor.role == "head")
+             row["id"], actor_key(actor), len(objections), actor.role != "manager")
     return row
 
 

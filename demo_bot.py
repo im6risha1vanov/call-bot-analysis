@@ -23,7 +23,7 @@ from reports import detail_button, fmt_call_time, fmt_phone, render_head as pg_r
 import rop_agent
 # training_simulator/tts/Deepgram-распознавание переехали в training_bot.py —
 # тренажёр живёт в отдельном боте, здесь они больше не нужны.
-from tools import resolve_actor
+from tools import is_privileged, resolve_actor
 
 BOT_TOKEN=os.environ['BOT_TOKEN']; DG_KEY=os.environ['DEEPGRAM_API_KEY']
 DB_PATH=ROOT/os.getenv('DATABASE_PATH','callbot.sqlite3')
@@ -339,7 +339,7 @@ async def assign_train_command(message: Message):
     if PG_POOL is None:
         return
     actor = await resolve_actor(PG_POOL, message.from_user.id)
-    if actor is None or actor.role != 'head':
+    if actor is None or not is_privileged(actor):
         await message.answer('Команда доступна только РОПу.')
         return
     args = (message.text or '').split(maxsplit=3)
@@ -496,7 +496,7 @@ async def check_command(message: Message):
     if PG_POOL is None:
         return
     actor = await resolve_actor(PG_POOL, message.from_user.id)
-    if actor is None or actor.role != 'head':
+    if actor is None or not is_privileged(actor):
         await message.answer('Команда доступна только руководителю.')
         return
 
@@ -677,7 +677,7 @@ async def approvals_command(message: Message):
     if PG_POOL is None:
         return
     actor = await resolve_actor(PG_POOL, message.from_user.id)
-    if actor is None or actor.role != 'head':
+    if actor is None or not is_privileged(actor):
         await message.answer('Команда доступна только руководителю.')
         return
     rows = await PG_POOL.fetch(
@@ -703,7 +703,7 @@ async def _resolve_approval(cq: CallbackQuery, approve: bool) -> None:
     if PG_POOL is None:
         return
     actor = await resolve_actor(PG_POOL, cq.from_user.id)
-    if actor is None or actor.role != 'head':
+    if actor is None or not is_privileged(actor):
         await cq.answer('Только руководитель может подтверждать.', show_alert=True)
         return
     task_id = int(cq.data.split(':')[1])

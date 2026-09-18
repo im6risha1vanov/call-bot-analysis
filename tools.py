@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 from datetime import time as dtime
@@ -24,6 +25,8 @@ from zoneinfo import ZoneInfo
 import asyncpg
 
 from reports import fmt_phone
+
+log = logging.getLogger("tools")
 
 
 class Forbidden(Exception):
@@ -37,8 +40,12 @@ class Actor:
     прислала модель."""
     telegram_user_id: int
     client_id: int
-    role: Literal["head", "manager"]
-    extension: str | None  # None для role == "head"
+    # head — руководитель отдела, ему идут отчёты по работе отдела.
+    # owner — владелец системы: технический отчёт о её работе, плюс те же права,
+    #   что у руководителя (он администрирует и проверяет систему), но бизнес-
+    #   отчёты ему в рабочее время не шлём — это не его инструмент.
+    role: Literal["head", "owner", "manager"]
+    extension: str | None  # у head и owner добавочного нет
 
 
 async def resolve_actor(pool: asyncpg.Pool, telegram_user_id: int) -> Actor | None:
@@ -52,14 +59,44 @@ async def resolve_actor(pool: asyncpg.Pool, telegram_user_id: int) -> Actor | No
                  role=row["role"], extension=row["extension"])
 
 
+def is_privileged(actor: Actor) -> bool:
+    """Полный доступ к данным отдела: руководитель и владелец системы. Всё, что
+    не менеджер, — а менеджера код жёстко сужает до его собственных звонков."""
+    return actor.role != "manager"
+
+
 async def head_chat_ids(pool: asyncpg.Pool, client_id: int) -> list[int]:
-    """Все руководители клиента, привязанные к боту. Раньше отчёты уходили
-    через fetchrow(... role='head'), то есть одному — какому именно, решал
-    порядок строк. С появлением второго руководителя это значило бы «кому-то
-    одному, кому повезёт»."""
+    """Кому уходят отчёты по работе отдела. Раньше здесь стоял
+    fetchrow(... role='head') — то есть одному, а какому именно, решал порядок
+    строк; с появлением второго руководителя это значило бы «кому повезёт».
+
+    Владелец системы (owner) в эту рассылку не входит: ему идёт технический
+    отчёт, а не разбор звонков. Исключение — если ни один руководитель к боту не
+    привязан: тогда отчёты уходят владельцу, иначе они потерялись бы молча, а
+    тихие потери в этой системе уже обходились сутками простоя."""
     rows = await pool.fetch(
         "SELECT telegram_user_id FROM employees "
         "WHERE client_id=$1 AND role='head' AND telegram_user_id IS NOT NULL ORDER BY id",
+        client_id,
+    )
+    if rows:
+        return [r["telegram_user_id"] for r in rows]
+
+    fallback = await pool.fetch(
+        "SELECT telegram_user_id FROM employees "
+        "WHERE client_id=$1 AND role='owner' AND telegram_user_id IS NOT NULL ORDER BY id",
+        client_id,
+    )
+    if fallback:
+        log.warning("ни один руководитель не привязан к боту — отчёты отдела уходят владельцу системы")
+    return [r["telegram_user_id"] for r in fallback]
+
+
+async def owner_chat_ids(pool: asyncpg.Pool, client_id: int) -> list[int]:
+    """Владельцы системы — получатели технического отчёта о её работе."""
+    rows = await pool.fetch(
+        "SELECT telegram_user_id FROM employees "
+        "WHERE client_id=$1 AND role='owner' AND telegram_user_id IS NOT NULL ORDER BY id",
         client_id,
     )
     return [r["telegram_user_id"] for r in rows]

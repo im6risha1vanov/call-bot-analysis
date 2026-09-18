@@ -43,16 +43,23 @@ SYSTEM_PROMPT = """Ты составляешь короткий ежедневн
 Не растекайся: чем спокойнее сутки, тем короче отчёт."""
 
 
-async def _owner_chat_id(pool: asyncpg.Pool) -> int | None:
-    """Владелец системы — тот, кому уходит технический отчёт. По умолчанию
-    HEAD_CHAT_ID из .env (он уже используется для системных сообщений);
-    OVERSIGHT_CHAT_ID позволяет развести владельца системы и РОПа, если это
-    разные люди."""
+async def _owner_chat_ids(pool: asyncpg.Pool) -> list[int]:
+    """Технический отчёт уходит владельцу системы — это отдельная роль от
+    руководителя отдела: руководителю нужны звонки, владельцу — работает ли
+    система. Роль в базе первична; переменные окружения остались как аварийный
+    путь, если владелец в employees ещё не заведён."""
+    rows = await pool.fetch(
+        "SELECT telegram_user_id FROM employees "
+        "WHERE role='owner' AND telegram_user_id IS NOT NULL ORDER BY id"
+    )
+    if rows:
+        return [r["telegram_user_id"] for r in rows]
+
     explicit = os.getenv("OVERSIGHT_CHAT_ID") or os.getenv("HEAD_CHAT_ID")
     if explicit and explicit.strip():
-        return int(explicit.strip())
-    row = await pool.fetchrow("SELECT telegram_user_id FROM employees WHERE role='head' LIMIT 1")
-    return row["telegram_user_id"] if row else None
+        log.warning("владелец системы не заведён в employees — технический отчёт уходит по адресу из .env")
+        return [int(explicit.strip())]
+    return []
 
 
 async def _render_with_model(metrics: dict) -> tuple[str, float]:
@@ -86,14 +93,14 @@ async def oversight_report(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
             text += (f"\n\nЖдут подтверждения: {metrics['queue']['awaiting_approval']} — "
                      f"посмотреть и решить: /approvals")
 
-    chat_id = await _owner_chat_id(pool)
-    if chat_id:
+    chat_ids = await _owner_chat_ids(pool)
+    if not chat_ids:
+        log.warning("некому отправить технический отчёт: нет роли owner в employees и не задан OVERSIGHT_CHAT_ID")
+    for chat_id in chat_ids:
         try:
             await _bot.send_message(chat_id, text)
         except Exception:
-            log.exception("не удалось отправить отчёт надзора")
-    else:
-        log.warning("некому отправить отчёт надзора: не задан OVERSIGHT_CHAT_ID/HEAD_CHAT_ID и нет head в employees")
+            log.exception("не удалось отправить технический отчёт, chat_id=%s", chat_id)
 
     return {
         "quiet": quiet,
