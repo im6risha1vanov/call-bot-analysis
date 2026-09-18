@@ -16,7 +16,7 @@
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
@@ -201,13 +201,17 @@ def _render_stats(stats: list[dict]) -> str:
 
 @register("rop_digest_evening")
 async def rop_digest_evening(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
-    client_id = json.loads(task["input"])["client_id"]
+    payload = json.loads(task["input"])
+    client_id = payload["client_id"]
     actors = await _head_actors(pool, client_id)
     if not actors:
         return {"skipped": "некому отправить: ни один получатель не привязан к боту"}
 
     tz = await _client_tz(pool, client_id)
-    day = datetime.now(ZoneInfo(tz)).date()
+    # day в задаче — необязательный: планировщик его не ставит (отчёт за
+    # сегодня), но он позволяет перегенерировать отчёт за прошедший день.
+    day = (date.fromisoformat(payload["day"]) if payload.get("day")
+           else datetime.now(ZoneInfo(tz)).date())
     day_start = datetime.combine(day, dtime.min, tzinfo=ZoneInfo(tz))
     day_end = day_start + timedelta(days=1)
 
@@ -217,7 +221,7 @@ async def rop_digest_evening(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
 
     period = {"start": day.isoformat(), "end": (day + timedelta(days=1)).isoformat()}
     question = (
-        f"Собери вечерний отчёт за сегодня ({period['start']}) по трём разделам. Статистику "
+        f"Собери вечерний отчёт за {period['start']} по трём разделам. Статистику "
         f"по менеджерам НЕ пиши — она уже посчитана кодом и будет добавлена перед твоим "
         f"текстом. Вот она, для опоры: {json.dumps(stats, ensure_ascii=False)}\n\n"
         f"Разделы, ровно в таком порядке и с такими заголовками:\n"
