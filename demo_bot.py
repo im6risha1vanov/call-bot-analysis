@@ -276,9 +276,10 @@ async def help_command(message):
         '/stats — сводка по менеджерам\n'
         '/reset — очистить статистику этого чата\n'
         '/check &lt;критерий&gt; [дней] — что модель увидела по критерию (руководителю)\n'
+        '/assign_train &lt;добавочный&gt; [режим] — назначить тренировку в тренажёре (руководителю)\n'
         '/trainings — последние тренировки, /training &lt;номер&gt; — одна подробно\n'
         '/approvals — задачи, ждущие подтверждения (руководителю)\n\n'
-        'chat_id этого чата: <code>{}</code> (пригодится для HEAD_CHAT_ID в .env)'.format(message.chat.id),
+        'id этого чата: <code>{}</code>'.format(message.chat.id),
         parse_mode='HTML')
 
 @router.message(Command('iam'))
