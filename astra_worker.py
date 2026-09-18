@@ -42,6 +42,7 @@ bot = Bot(token=os.environ["BOT_TOKEN"])
 POLL_INTERVAL_SEC = 5
 SWEEP_INTERVAL_SEC = 60
 DIGEST_GRACE_HOURS = 2
+EMPLOYEE_SYNC_INTERVAL_SEC = 24 * 3600
 
 POLL_OVERLAP_MIN = 3
 INITIAL_LOOKBACK_MIN = 60
@@ -504,17 +505,59 @@ async def maybe_send_digests(pool: asyncpg.Pool) -> None:
             log.exception("ошибка дайджеста, client id=%s", client["id"])
 
 
+# ---------------------------------------------------------- справочник АТС
+# Раньше синхронизацию сотрудников из Mango крутил старый callbot.service.
+# После его остановки это единственное место, которое обновляет employees.
+
+async def sync_employees_for_client(pool: asyncpg.Pool, client: asyncpg.Record) -> None:
+    key = decrypt(client["vpbx_api_key_enc"])
+    salt = decrypt(client["vpbx_api_salt_enc"])
+    try:
+        users = await mango_client.fetch_employees(key, salt)
+    except Exception:
+        log.exception("mango employee sync failed, client id=%s", client["id"])
+        return
+    n = 0
+    for u in users:
+        general = u.get("general") or {}
+        telephony = u.get("telephony") or {}
+        extension = str(telephony.get("extension") or "").strip()
+        if not extension:
+            continue
+        await pool.execute(
+            """
+            INSERT INTO employees (client_id, extension, full_name, synced_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (client_id, extension) DO UPDATE SET
+                full_name = EXCLUDED.full_name, synced_at = now()
+            """,
+            client["id"], extension, general.get("name") or "",
+        )
+        n += 1
+    log.info("client id=%s mango employee sync: %d сотрудников", client["id"], n)
+
+
+async def sync_all_employees(pool: asyncpg.Pool) -> None:
+    clients = await pool.fetch("SELECT * FROM clients WHERE processing_enabled = true")
+    for client in clients:
+        await sync_employees_for_client(pool, client)
+
+
 # ----------------------------------------------------------------------- цикл
 
 async def main() -> None:
     pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=5)
     log.info("astra worker started (poll + enqueue only; разбор — в queue_runner)")
     last_sweep = 0.0
+    last_employee_sync = 0.0
     next_poll_at: dict[int, float] = {}
     try:
         while True:
             now = time.monotonic()
             await poll_all_clients(pool, next_poll_at)
+            if last_employee_sync == 0.0 or now - last_employee_sync > EMPLOYEE_SYNC_INTERVAL_SEC:
+                await sync_all_employees(pool)
+                last_employee_sync = now
             if now - last_sweep > SWEEP_INTERVAL_SEC:
                 await sweep_timeouts(pool)
                 await maybe_send_digests(pool)

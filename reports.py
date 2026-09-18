@@ -1,6 +1,6 @@
 """
-Рендер отчётов и отправка длинных сообщений — общее для demo_bot.py (ручной
-аплоад) и worker.py (автосбор из Mango).
+Рендер отчётов и отправка длинных сообщений — общее для Telegram-бота
+(demo_bot.py) и воркера опроса Mango (astra_worker.py).
 """
 
 import asyncio
@@ -37,7 +37,7 @@ def fmt_phone(number: str | None) -> str | None:
 def fmt_call_time(started_at: datetime | None, tz_name: str) -> str | None:
     """«14.09 13:43» — то же время, что показывает интерфейс Mango, для
     быстрого поиска звонка. started_at — TIMESTAMPTZ из calls.call_started_at
-    (UTC-aware); None у звонков, загруженных до этого поля или вручную."""
+    (UTC-aware); None, если Манго не отдала время начала."""
     if started_at is None:
         return None
     local = started_at.astimezone(ZoneInfo(tz_name))
@@ -103,10 +103,9 @@ def render_short(short_report: dict, level: str | None, duration: float, manager
 
 
 def detail_button(call_id: int, source: str = "pg", ready: bool = False) -> InlineKeyboardMarkup:
-    """Кнопка под коротким отчётом. callback_data «detail:<source>:<id>» —
-    source различает Postgres-звонки (автосбор из Mango, worker.py) и
-    SQLite-звонки (ручной аплоад, demo_bot.py) — у них разные пространства
-    id. Длина всегда далека от лимита Telegram в 64 байта на это поле."""
+    """Кнопка под коротким отчётом. callback_data «detail:<source>:<id>».
+    source='astra' — разбор Astra; 'pg' оставлен для старых сообщений в чатах.
+    Длина всегда далека от лимита Telegram в 64 байта на это поле."""
     text = "Разбор готов" if ready else "Подробный разбор"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=text, callback_data=f"detail:{source}:{call_id}")]

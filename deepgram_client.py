@@ -1,7 +1,7 @@
 """
-Распознавание речи через Deepgram — общий модуль для demo_bot.py (ручной
-аплоад) и worker.py (автосбор из Mango). Диаризация средствами Deepgram
-(diarize=true), ffmpeg не нужен.
+Распознавание речи через Deepgram — для разбора записей из Mango
+(handlers/analyze_call.py) и голосовых реплик тренажёра. Диаризация
+средствами Deepgram (diarize=true), ffmpeg не нужен.
 """
 
 import os

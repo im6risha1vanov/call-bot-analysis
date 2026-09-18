@@ -1,7 +1,5 @@
--- Расширение общей Postgres-базы (той же, что использует /opt/callbot) для
--- параллельного разбора звонков через Astra — сравнение с Claude на тех же
--- реальных звонках. Отдельная таблица, а не колонки на calls: не трогаем
--- схему, которой владеет Claude-сторона, и удобно дропнуть/пересоздать
+-- Расширение общей Postgres-базы для разбора звонков через Astra.
+-- Отдельная таблица, а не колонки на calls: удобно дропнуть/пересоздать
 -- независимо при экспериментах с промтами.
 
 CREATE TABLE IF NOT EXISTS astra_analysis (
@@ -26,9 +24,8 @@ CREATE TABLE IF NOT EXISTS astra_analysis (
 
 CREATE INDEX IF NOT EXISTS astra_analysis_status_idx ON astra_analysis (status);
 
--- Дайджест Astra шлётся независимо от дайджеста Claude (тот же клиент,
--- отдельный бот) — не переиспользуем clients.last_digest_sent_date, чтобы не
--- конфликтовать с гейтингом Claude-воркера.
+-- Дайджест Astra не переиспользует clients.last_digest_sent_date — своё
+-- состояние, чтобы не зависеть от старого конвейера.
 CREATE TABLE IF NOT EXISTS astra_digest_state (
     client_id            INTEGER PRIMARY KEY REFERENCES clients(id) ON DELETE CASCADE,
     last_digest_sent_date DATE

@@ -149,7 +149,7 @@ def _system_prompt(scenario: dict) -> str:
 def strip_speaker_tags(transcript: str) -> str:
     """Убирает разметку [MM:SS Спикер N] из короткого голосового сообщения —
     для одиночной реплики важны только слова, не диаризация. Публичная —
-    используется и в demo_bot.py при разборе voice-сообщений менеджера."""
+    используется в training_bot.py на ходе тренировки."""
     import re
     return re.sub(r"\[\d{2}:\d{2} Спикер \d+\]\s*", "", transcript).strip()
 
@@ -238,7 +238,7 @@ def _to_claude_messages(transcript: list[dict]) -> list[dict]:
 async def start_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
                          assigned_by: str | None) -> asyncpg.Record:
     """Создаёт сессию и генерирует первую (клиентскую) реплику. Не проверяет
-    лимиты — вызывающий код (demo_bot.py) обязан проверить get_active_session
+    лимиты — вызывающий код (training_bot.py) обязан проверить get_active_session
     и sessions_today ДО вызова, чтобы дать пользователю понятное сообщение,
     а не проглатывать отказ здесь."""
     scenario_kind, scenario = await pick_scenario(pool, actor.client_id, actor_key(actor), topic)

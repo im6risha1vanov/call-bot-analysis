@@ -5,9 +5,6 @@ ai.starimg.ru вместо Anthropic напрямую).
     score_call()        — извлечение фактов и проверка критериев, plus compute_level()
     short_report_call() — короткий отчёт (ХОРОШО/СЛАБО), всегда выполняется
     review_call()        — подробный разбор, только по кнопке «Подробный разбор»
-    analyze()            — старый комбинированный путь (score+review), для
-                            обратной совместимости со старым ручным аплоадом
-                            в demo_bot.py — НЕ используется новым astra_worker.py
 
 Баллы считает Python, а не модель. Модель отвечает только на вопрос «пройден
 критерий или нет» — это суждение. Сложение весов и нормализация по применимым
@@ -253,26 +250,10 @@ async def short_report_call(transcript: str, scores: dict, rows: list[dict], lev
 
 
 async def review_call(transcript: str, scores: dict, rows: list[dict]) -> tuple[dict, float]:
-    """Подробный разбор — только по нажатию кнопки «Подробный разбор» в новом
-    (astra_worker.py) конвейере; не запускается заранее ни для одного звонка."""
+    """Подробный разбор — только по нажатию кнопки «Подробный разбор»;
+    не запускается заранее ни для одного звонка."""
     user = (
         f"ТРАНСКРИПТ:\n{transcript}\n\n"
         f"---\n\nРЕЗУЛЬТАТЫ ПРОВЕРКИ:\n{build_brief(scores, rows)}"
     )
     return await _call(REVIEW_PROMPT, user, 5000)
-
-
-async def analyze(transcript: str) -> tuple[dict, float]:
-    """Старый комбинированный путь (score+review всегда) — оставлен только
-    для обратной совместимости со старым ручным аплоадом в demo_bot.py.
-    Новый конвейер сравнения (astra_worker.py) его не использует."""
-    scores, cost1 = await _call(SCORE_PROMPT, transcript, 3000)
-    score, rows = compute_score(scores)
-
-    user = (
-        f"ТРАНСКРИПТ:\n{transcript}\n\n"
-        f"---\n\nРЕЗУЛЬТАТЫ ПРОВЕРКИ:\n{build_brief(scores, rows)}"
-    )
-    report, cost2 = await _call(REVIEW_PROMPT, user, 5000)
-
-    return {**scores, **report, "score": score, "rows": rows}, cost1 + cost2
