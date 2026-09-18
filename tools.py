@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from reports import fmt_phone
+
 
 class Forbidden(Exception):
     """Действующему лицу не положен доступ к запрошенным данным."""
@@ -107,6 +109,25 @@ def _local_iso(dt, tz_name: str) -> str | None:
     return dt.astimezone(ZoneInfo(tz_name)).isoformat(timespec="minutes")
 
 
+# Английские идентификаторы из базы модель видеть может, а в отчёте они
+# выглядеть не должны — переводим здесь, на границе выдачи данных, а не надеясь
+# на аккуратность модели. Названия сценариев повторяют SCENARIOS из
+# training_simulator: импортировать его сюда нельзя, он сам импортирует tools.
+SCENARIO_LABELS = {
+    "brush_off_handled": "отговорки",
+    "gatekeeper_passed": "не тот человек",
+    "implication_questions": "поверхностные вопросы",
+    "explicit_need": "не проговорена потребность",
+    "decision_influence": "скрытое влияние на решение",
+    "no_early_pitch": "ранняя презентация",
+}
+MODE_LABELS = {"dialog": "разговор целиком", "drill": "отработка возражений"}
+SESSION_STATUS_LABELS = {
+    "active": "идёт", "completed": "завершена",
+    "abandoned": "прервана", "failed": "сбой",
+}
+
+
 def _drill_summary(drill_state_json) -> dict | None:
     """Сводка по отработке возражений: сколько зачтено и какие именно не
     зачтены — агенту РОПа этого хватает, полные ответы менеджера ему не нужны."""
@@ -170,7 +191,8 @@ async def find_calls(pool: asyncpg.Pool, actor: Actor, period: dict | None = Non
 
     rows = await pool.fetch(
         """
-        SELECT c.id, c.extension, c.call_started_at, c.duration_seconds, a.level, a.short_report
+        SELECT c.id, c.extension, c.client_number, c.call_started_at, c.duration_seconds,
+               a.level, a.short_report
         FROM astra_analysis a JOIN calls c ON c.id = a.call_id
         WHERE c.client_id = $1 AND a.status = 'analyzed'
           AND ($2::text IS NULL OR c.extension = $2)
@@ -186,6 +208,10 @@ async def find_calls(pool: asyncpg.Pool, actor: Actor, period: dict | None = Non
     )
     return [
         {
+            # Звонок опознают по номеру клиента: сотрудник ищет по нему в Манго.
+            # Внутренний номер записи (call_id) наружу не показываем — в
+            # интерфейсе Манго его нет, найти по нему звонок нельзя.
+            "client_phone": fmt_phone(r["client_number"]),
             "call_id": r["id"],
             "manager_extension": r["extension"],
             "started_at": _local_iso(r["call_started_at"], client["timezone"]),
@@ -202,7 +228,7 @@ async def find_calls(pool: asyncpg.Pool, actor: Actor, period: dict | None = Non
 async def get_call(pool: asyncpg.Pool, actor: Actor, call_id: int) -> dict:
     row = await pool.fetchrow(
         """
-        SELECT c.id, c.client_id, c.extension, c.call_started_at, c.duration_seconds,
+        SELECT c.id, c.client_id, c.extension, c.client_number, c.call_started_at, c.duration_seconds,
                c.transcript, a.level, a.analysis, a.short_report, a.detailed_report
         FROM calls c LEFT JOIN astra_analysis a ON a.call_id = c.id
         WHERE c.id = $1
@@ -216,6 +242,7 @@ async def get_call(pool: asyncpg.Pool, actor: Actor, call_id: int) -> dict:
 
     client = await _require_client(pool, actor.client_id)
     return {
+        "client_phone": fmt_phone(row["client_number"]),
         "call_id": row["id"],
         "manager_extension": row["extension"],
         "started_at": _local_iso(row["call_started_at"], client["timezone"]),
@@ -377,13 +404,16 @@ async def get_training_history(pool: asyncpg.Pool, actor: Actor, manager_extensi
     )
     return [
         {
-            "session_id": r["id"], "manager_extension": r["extension"], "scenario": r["scenario_kind"],
-            "topic": r["topic"], "status": r["status"], "level": r["level"], "score": r["score"],
+            "session_id": r["id"], "manager_extension": r["extension"],
+            "scenario": SCENARIO_LABELS.get(r["scenario_kind"], r["scenario_kind"]),
+            "topic": r["topic"],
+            "status": SESSION_STATUS_LABELS.get(r["status"], r["status"]),
+            "level": r["level"], "score": r["score"],
             "turns": r["turns_count"],
             # dialog — разговор целиком, оценён теми же критериями, что и реальные
             # звонки (level сравним с get_stats). drill — отработка возражений
             # поштучно: level не ставится, score — доля зачтённых ответов.
-            "mode": r["mode"],
+            "mode": MODE_LABELS.get(r["mode"], r["mode"]),
             "objections_handled": _drill_summary(r["drill_state"]) if r["mode"] == "drill" else None,
             "started_at": _local_iso(r["started_at"], client["timezone"]),
             "ended_at": _local_iso(r["ended_at"], client["timezone"]),

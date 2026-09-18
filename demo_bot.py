@@ -19,7 +19,7 @@ log=logging.getLogger('callbot')
 from analysis import CRITERIA, analyze, review_call
 # алиасы: у этого файла уже есть свои render_head/render_manager (старый ручной
 # аплоад) — импорт под своими именами их бы тихо подменил
-from reports import detail_button, fmt_call_time, render_head as pg_render_head, render_manager as pg_render_manager
+from reports import detail_button, fmt_call_time, fmt_phone, render_head as pg_render_head, render_manager as pg_render_manager
 import rop_agent
 # training_simulator/tts/Deepgram-распознавание переехали в training_bot.py —
 # тренажёр живёт в отдельном боте, здесь они больше не нужны.
@@ -468,8 +468,12 @@ def _render_check(rows, key: str, title: str, days: int | None, client_tz: str) 
                 failed += 1
                 mark = '❌ провален'
         evidence = (row or {}).get('evidence') or '(обоснование не записано)'
+        # Звонок опознаём по номеру клиента: по нему сотрудник находит запись в
+        # Манго. Внутренний номер записи в базе для этого бесполезен — в
+        # интерфейсе Манго его нет.
+        phone = fmt_phone(r['client_number']) or 'номер неизвестен'
         lines.append(
-            f"\n\n<b>#{r['call_id']}</b> · {html.escape(when)} · {html.escape(name)} · {mark}\n"
+            f"\n\n<b>{html.escape(phone)}</b> · {html.escape(when)} · {html.escape(name)} · {mark}\n"
             f"<i>{html.escape(str(evidence)[:400])}</i>"
         )
 
@@ -518,7 +522,7 @@ async def check_command(message: Message):
 
     rows = await PG_POOL.fetch(
         """
-        SELECT a.call_id, a.analysis, a.level, c.call_started_at, c.extension, e.full_name
+        SELECT a.call_id, a.analysis, a.level, c.client_number, c.call_started_at, c.extension, e.full_name
         FROM astra_analysis a
         JOIN calls c ON c.id = a.call_id
         LEFT JOIN employees e ON e.client_id = c.client_id AND e.extension = c.extension

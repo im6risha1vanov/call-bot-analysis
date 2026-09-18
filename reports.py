@@ -21,6 +21,19 @@ def esc(s) -> str:
     return html.escape(str(s or ""))
 
 
+def fmt_phone(number: str | None) -> str | None:
+    """Номер клиента — основной способ найти звонок: сотрудник ищет по нему в
+    Манго. Он есть у всех звонков, в отличие от времени начала (Манго отдаёт
+    его примерно в половине случаев). Формат канонический, чтобы номер можно
+    было скопировать в поиск как есть."""
+    if not number:
+        return None
+    digits = "".join(ch for ch in str(number) if ch.isdigit())
+    if not digits:
+        return None
+    return f"+{digits}"
+
+
 def fmt_call_time(started_at: datetime | None, tz_name: str) -> str | None:
     """«14.09 13:43» — то же время, что показывает интерфейс Mango, для
     быстрого поиска звонка. started_at — TIMESTAMPTZ из calls.call_started_at
@@ -53,7 +66,7 @@ async def send_long(bot: Bot, chat_id: int, text: str) -> None:
 
 
 def render_short(short_report: dict, level: str | None, duration: float, manager_name: str | None = None,
-                  call_time: str | None = None) -> str:
+                  call_time: str | None = None, client_number: str | None = None) -> str:
     """Единый короткий формат по каждому звонку — prompt_reports_final.md,
     п.2-4. Тот же вид для успешных и провальных, отличается только
     содержимым. manager_name=None — своя копия менеджеру (без имени в шапке),
@@ -63,9 +76,14 @@ def render_short(short_report: dict, level: str | None, duration: float, manager
     mm, ss = divmod(int(duration or 0), 60)
     level_str = level or "—"
     name_part = f"{esc(manager_name)} · " if manager_name else ""
+    # Номер клиента в шапке — по нему сотрудник находит звонок в Манго. Раньше
+    # для этого предлагался внутренний номер записи в базе, но в интерфейсе
+    # Манго его нет, и найти по нему звонок было нельзя.
+    phone = fmt_phone(client_number)
+    phone_part = f"{esc(phone)} · " if phone else ""
     time_part = f"{esc(call_time)} · " if call_time else ""
     result = esc(short_report.get("result") or "")
-    out = [f"📞 {name_part}{time_part}{mm}:{ss:02d} · {level_str} {result}".rstrip()]
+    out = [f"📞 {name_part}{phone_part}{time_part}{mm}:{ss:02d} · {level_str} {result}".rstrip()]
 
     out += ["", "ХОРОШО"]
     for g in short_report.get("good") or [{"time": None, "text": "нечем"}]:
