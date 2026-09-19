@@ -4,9 +4,7 @@
 
 Open work on the live bot (snapshot 18.09.2026). Do not invent stage 6.
 
-## Blocked: GitHub publish
-
-Push of this tree to a new private GitHub repo `call-bot-analysis` did **not** finish. On `bot-server` (`9015421-nt422325`) `gh` is installed but **not logged in**. There is no GitHub SSH key and no `GITHUB_TOKEN`/`GH_TOKEN`. Needs Гриша: `gh auth login` on this host as the GitHub user that should own the private repo (then push local `master` to `main`).
+Private GitHub repo (done): https://github.com/im6risha1vanov/call-bot-analysis — `main`, code snapshot `fb52e30`.
 
 ## Product remaining
 
@@ -25,3 +23,4 @@ Push of this tree to a new private GitHub repo `call-bot-analysis` did **not** f
 - Old Claude poller/stack disabled (`callbot*.service`).
 - SQLite and manual recording upload stripped (`029e294`).
 - Employee sync moved to `astra_worker.sync_all_employees()`.
+- Private GitHub backup published: https://github.com/im6risha1vanov/call-bot-analysis (`main`, code snapshot `fb52e30`).

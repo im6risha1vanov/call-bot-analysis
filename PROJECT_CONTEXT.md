@@ -42,7 +42,7 @@ Postgres tables include `clients`, `employees`, `calls`, `astra_analysis`, `astr
 - Old Claude stack **off**: `callbot.service`, `callbot-worker.service`, `callbot-api.service` stopped/disabled. Files remain on disk under `/opt/callbot` and must not be used as the live bot.
 - SQLite / manual upload **removed** from Astra (`029e294`). Postgres + Mango only.
 - Astra still running: bot, worker, queue-runner, trainer.
-- Local git was `master` without a remote; this repo is the backup other agents should clone.
+- Private GitHub backup: https://github.com/im6risha1vanov/call-bot-analysis (`main` at `fb52e30`).
 - Spec completed through **stage 5** (queue → tools → ROP agent → trainer → oversight). **Stage 6 is not specified.**
 
 ## Remaining (see CURRENT_TASK.md)
