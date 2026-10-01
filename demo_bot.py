@@ -18,6 +18,8 @@ from analysis import CRITERIA, review_call
 from reports import detail_button, fmt_call_time, fmt_phone, render_head, render_manager
 import rop_agent
 from tools import is_privileged, resolve_actor
+from methodology.tools import get_course_evaluation, get_course_stats
+from methodology.evaluation import render as render_course
 
 BOT_TOKEN=os.environ['BOT_TOKEN']
 router=Router()
@@ -69,6 +71,9 @@ async def help_command(message):
         '/check &lt;критерий&gt; [дней] — что модель увидела по критерию (руководителю)\n'
         '/assign_train &lt;добавочный&gt; [режим] — назначить тренировку в тренажёре (руководителю)\n'
         '/trainings — последние тренировки, /training &lt;номер&gt; — одна подробно\n'
+        '/methodology &lt;номер звонка&gt; — отдельный разбор по курсу\n'
+        '/methodology_training &lt;номер&gt; — разбор тренировки по курсу\n'
+        '/methodology_stats &lt;начало&gt; &lt;конец&gt; [добавочный] — наблюдения по курсу\n'
         '/approvals — задачи, ждущие подтверждения (руководителю)\n\n'
         'Свободный текст — вопрос по отделу.\n'
         'id этого чата: <code>{}</code>'.format(message.chat.id),
@@ -310,6 +315,8 @@ def _training_result(row) -> str:
         return row['status']
     if row['mode'] == 'drill':
         state = json.loads(row['drill_state']) if row['drill_state'] else {}
+        if state.get('version'):
+            return 'разбор по курсу — /methodology_training ' + str(row['id'])
         results = state.get('results') or []
         return f"зачтено {sum(1 for r in results if r.get('passed'))} из {len(results)}"
     return row['level'] or 'без оценки'
@@ -395,7 +402,16 @@ async def training_detail_command(message: Message):
     if row['is_test']:
         out.append('<i>Пробная сессия руководителя — в статистику отдела не входит.</i>')
 
-    if row['mode'] == 'drill':
+    from methodology.training import context
+    if await context(PG_POOL, row['id']):
+        data = await get_course_evaluation(PG_POOL, actor, training_session_id=row['id'])
+        if data.get('result'):
+            await send_plain(message, render_course(data['result'], detailed=True))
+        else:
+            await message.answer(data.get('reason') or 'Разбор ещё обрабатывается. Последние ответы:')
+        for turn in json.loads(row['transcript']):
+            out.append(f"\n<b>{'Менеджер' if turn['role']=='manager' else 'Клиент'}:</b> {html.escape(str(turn['text'])[:600])}")
+    elif row['mode'] == 'drill':
         state = json.loads(row['drill_state']) if row['drill_state'] else {}
         for i, r in enumerate((state.get('results') or []), 1):
             mark = '✅' if r.get('passed') else '❌'
@@ -492,6 +508,63 @@ async def reject_callback(cq: CallbackQuery):
 
 # ------------------------------------------------------------ агент РОПа
 
+async def send_plain(message, text):
+    from methodology.messages import split_plain
+    for chunk in split_plain(text):
+        await message.answer(chunk, parse_mode=None)
+
+
+@router.message(Command('methodology', 'methodology_training'))
+async def methodology_command(message: Message):
+    if PG_POOL is None:
+        return
+    actor = await resolve_actor(PG_POOL, message.from_user.id)
+    if actor is None:
+        return
+    args = (message.text or '').split()
+    if len(args) != 2 or not args[1].isdigit():
+        await message.answer('Разбор по курсу: /methodology <номер звонка> или /methodology_training <номер тренировки>.')
+        return
+    from tools import Forbidden
+    key = 'training_session_id' if args[0].split('@')[0] == '/methodology_training' else 'call_id'
+    try:
+        data = await get_course_evaluation(PG_POOL, actor, **{key: int(args[1])})
+    except Forbidden:
+        await message.answer('Запись недоступна.')
+        return
+    await send_plain(message, render_course(data['result'], detailed=True) if data.get('result') else data.get('reason') or 'Разбор ещё не завершён.')
+
+
+@router.message(Command('methodology_stats'))
+async def methodology_stats_command(message: Message):
+    if PG_POOL is None:
+        return
+    actor = await resolve_actor(PG_POOL, message.from_user.id)
+    if actor is None:
+        return
+    args = (message.text or '').split()
+    if len(args) not in (3, 4):
+        await message.answer('Статистика по курсу: /methodology_stats <дата начала> <дата окончания> [добавочный]. Даты ГГГГ-ММ-ДД, окончание не включается.')
+        return
+    try:
+        data = await get_course_stats(PG_POOL, actor, {'start': args[1], 'end': args[2]}, args[3] if len(args) == 4 else None)
+    except (ValueError, PermissionError):
+        await message.answer('Проверьте даты и доступ к добавочному.')
+        return
+    if not data['available']:
+        await message.answer('Методика курса выключена.')
+        return
+    from methodology.profiles import COMMON, OPERATOR_CRITERIA, PROFILE_CRITERIA
+    titles = COMMON | OPERATOR_CRITERIA
+    for profile in PROFILE_CRITERIA.values():
+        titles |= profile
+    lines = [data['note']]
+    for key, value in data['criteria'].items():
+        lines.append(f"{titles.get(key,key)}: выполнено {value['passed']}, не выполнено {value['failed']}, неприменимо {value['not_applicable']}, недостаточно данных {value['insufficient_data']}.")
+    if not data['criteria']:
+        lines.append('Наблюдений за этот период пока нет.')
+    await send_plain(message, '\n'.join(lines))
+
 @router.message(F.text)
 async def rop_question(message: Message):
     """Свободный вопрос агенту РОПа (Этап 3). Регистрируется после команд —
@@ -507,7 +580,7 @@ async def rop_question(message: Message):
 
     status = await message.answer('Секунду, смотрю данные…')
     try:
-        text = await rop_agent.answer(PG_POOL, actor, message.text or '')
+        text = await rop_agent.answer(PG_POOL, actor, message.text or '', allow_course=True)
     except Exception:
         log.exception('ошибка агента РОПа, telegram_user_id=%s', message.from_user.id)
         text = 'Не получилось обработать вопрос, попробуйте ещё раз.'

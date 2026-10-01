@@ -57,3 +57,11 @@ Do not commit `.env`, venv, keys, credentials, call recordings, or sqlite dumps.
 - Work on `bot-server` / `/opt/callbot-astra`. Do **not** patch `bt-vps` (`ams-1-vm-cvf5`, `bt-dispatch-bot`) or `/opt/callbot`.
 - Do not paste API keys or `.env` into chat.
 - Owner: Гриша Иванов.
+
+## Методика курса — 1 октября 2026
+
+Ветка `feat/course-methodology-2026-10` добавляет параллельную оценку по ролям,
+продуктам и этапам, предметный тренажёр и полный откат одной командой.
+Исходная шкала и её автоматические решения сохранены. Перед дальнейшей работой
+прочитайте [METHODOLOGY_IMPLEMENTATION.md](METHODOLOGY_IMPLEMENTATION.md): там
+режимы, команды, таблицы, проверки, ограничения и контекст следующему сеансу.

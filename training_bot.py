@@ -38,6 +38,8 @@ log = logging.getLogger('callbot-trainer')
 
 import tts  # noqa: E402  — читает переменные окружения при импорте, только после load_dotenv
 import training_simulator  # noqa: E402
+from methodology import training as course_training
+from methodology.runtime import training_enabled
 from deepgram_client import transcribe_bytes as dg_transcribe_bytes  # noqa: E402
 from tools import resolve_actor  # noqa: E402
 
@@ -56,13 +58,23 @@ START_TEXT = (
 )
 
 
+def start_text():
+    if training_enabled():
+        return ('Тренажёр продаж и сопровождения: разговор целиком или короткие упражнения. '
+                'Начать: /train. Выбрать продукт и ситуацию: /scenarios. '
+                'Отвечайте голосом или текстом. Завершить: /stop. '
+                'После тренировки получите разбор действий, цитаты и задачу для повтора. '
+                'Повторить ситуацию с изменёнными обстоятельствами: /repeat.')
+    return START_TEXT
+
+
 def _stop_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='Завершить тренировку', callback_data='train_stop')
     ]])
 
 
-async def _send_training_reply(message: Message, result: training_simulator.TurnResult) -> None:
+async def _send_training_reply(message: Message, result: training_simulator.TurnResult, session_id: int | None = None) -> float:
     """Голос — основной путь; текст — откат, если TTS ещё не настроен
     (см. tts.py) или синтез не удался.
 
@@ -74,12 +86,16 @@ async def _send_training_reply(message: Message, result: training_simulator.Turn
     if result.note:
         await message.answer(result.note)
     if not result.reply_text:
-        return
+        return 0.0
     # Кнопка висит на реплике клиента, пока тренировка идёт: выйти можно в любой
     # момент, а не только досидев до конца.
     markup = None if result.ended else _stop_keyboard()
+    audio_cost = 0.0
     try:
         ogg_bytes, _cost = await tts.synthesize_ogg(result.reply_text)
+        audio_cost = _cost
+        if session_id is not None:
+            await course_training.record_audio_cost(PG_POOL, session_id, audio_cost)
         await message.bot.send_voice(message.chat.id, voice=BufferedInputFile(ogg_bytes, filename='client.ogg'),
                                       reply_markup=markup)
     except tts.TTSNotConfigured:
@@ -87,6 +103,7 @@ async def _send_training_reply(message: Message, result: training_simulator.Turn
     except Exception:
         log.exception('ошибка синтеза речи тренажёра')
         await message.answer(result.reply_text, reply_markup=markup)
+    return audio_cost
 
 
 async def _process_turn(message: Message, session, manager_text: str) -> None:
@@ -98,7 +115,7 @@ async def _process_turn(message: Message, session, manager_text: str) -> None:
         log.exception('ошибка хода тренажёра, session id=%s', session['id'])
         await message.answer('Не удалось обработать ответ, попробуйте ещё раз.')
         return
-    await _send_training_reply(message, result)
+    await _send_training_reply(message, result, session['id'])
     if result.ended:
         level_line = f' Уровень: {result.level}.' if result.level else ''
         await message.answer(f'Тренировка завершена.{level_line} Подробности доступны агенту РОПа.')
@@ -114,7 +131,7 @@ INTRO = {
 
 
 async def _launch(message: Message, actor, topic: str | None, assigned_by: str | None,
-                   mode: str = 'dialog') -> None:
+                   mode: str = 'dialog', assignment_id: int | None = None) -> int | None:
     existing = await training_simulator.get_active_session(PG_POOL, actor)
     if existing is not None:
         await message.answer('У вас уже есть незавершённая тренировка — закончите её, прежде чем начинать новую.')
@@ -126,13 +143,22 @@ async def _launch(message: Message, actor, topic: str | None, assigned_by: str |
         await message.answer(
             f'Уже {done_today} тренировки сегодня — дневной лимит ({training_simulator.MAX_SESSIONS_PER_DAY}) исчерпан.')
         return
-    if mode == 'drill':
-        session = await training_simulator.start_drill_session(PG_POOL, actor, topic, assigned_by)
-    else:
-        session = await training_simulator.start_session(PG_POOL, actor, topic, assigned_by)
+    try:
+        if mode == 'drill':
+            session = await training_simulator.start_drill_session(PG_POOL, actor, topic, assigned_by, assignment_id)
+        else:
+            session = await training_simulator.start_session(PG_POOL, actor, topic, assigned_by, assignment_id)
+    except course_training.TrainingLimit as exc:
+        await message.answer(str(exc))
+        return None
     opening = json.loads(session['transcript'])[0]['text']
-    await message.answer(INTRO[mode])
-    await _send_training_reply(message, training_simulator.TurnResult(opening, False))
+    context = await course_training.context(PG_POOL, session['id'])
+    if assignment_id is not None and not context:
+        await PG_POOL.execute('UPDATE pending_train_assignments SET consumed=true WHERE id=$1 AND client_id=$2 AND extension=$3',
+                              assignment_id, actor.client_id, actor.extension)
+    await message.answer(course_training.intro(json.loads(context['scenario']), mode) if context else INTRO[mode])
+    await _send_training_reply(message, training_simulator.TurnResult(opening, False), session['id'])
+    return session['id']
 
 
 async def _require_employee(message: Message):
@@ -143,7 +169,7 @@ async def _require_employee(message: Message):
         return None
     actor = await resolve_actor(PG_POOL, message.from_user.id)
     if actor is None:
-        await message.answer('Вы не привязаны к системе. Попросите РОПа прислать ссылку /invite в основном боте.')
+        await message.answer('Вы не привязаны к системе. Попросите руководителя подключить вас к основному боту.')
         return None
     return actor
 
@@ -155,7 +181,7 @@ async def start_command(message: Message, command: CommandObject):
     даст ему написать первым), и стартует назначенную сессию."""
     payload = (command.args or '').strip()
     if not payload.startswith('train_'):
-        await message.answer(START_TEXT)
+        await message.answer(start_text())
         return
 
     actor = await _require_employee(message)
@@ -164,7 +190,7 @@ async def start_command(message: Message, command: CommandObject):
     try:
         assignment_id = int(payload.removeprefix('train_'))
     except ValueError:
-        await message.answer(START_TEXT)
+        await message.answer(start_text())
         return
 
     assignment = await PG_POOL.fetchrow(
@@ -173,10 +199,9 @@ async def start_command(message: Message, command: CommandObject):
     if not assignment or assignment['extension'] != actor.extension or assignment['client_id'] != actor.client_id:
         await message.answer('Это назначение не для вас или уже использовано. Начать обычную тренировку: /train')
         return
-    await PG_POOL.execute('UPDATE pending_train_assignments SET consumed=true WHERE id=$1', assignment_id)
     await _launch(message, actor, topic=assignment['topic'],
                   assigned_by=str(assignment['assigned_by_telegram_user_id']),
-                  mode=assignment['mode'])
+                  mode=assignment['mode'], assignment_id=assignment_id)
 
 
 @router.callback_query(F.data == 'train_stop')
@@ -224,7 +249,7 @@ async def stop_command(message: Message):
 
 @router.message(Command('help'))
 async def help_command(message: Message):
-    await message.answer(START_TEXT)
+    await message.answer(start_text())
 
 
 def _mode_keyboard() -> InlineKeyboardMarkup:
@@ -242,12 +267,39 @@ async def train_command(message: Message):
     if actor is None:
         return
     arg = (message.text or '').partition(' ')[2].strip().lower()
-    if arg in ('drill', 'возражения', 'отработка'):
+    if training_enabled() and arg and arg.split(' ', 1)[0] in ('drill', 'возражения', 'отработка'):
+        await _launch(message, actor, topic=arg.partition(' ')[2] or None, assigned_by=None, mode='drill')
+    elif training_enabled() and course_training.find(arg):
+        await _launch(message, actor, topic=arg, assigned_by=None, mode='dialog')
+    elif arg in ('drill', 'возражения', 'отработка'):
         await _launch(message, actor, topic=None, assigned_by=None, mode='drill')
     elif arg in ('dialog', 'разговор', 'звонок'):
         await _launch(message, actor, topic=None, assigned_by=None, mode='dialog')
     else:
         await message.answer('Что тренируем?', reply_markup=_mode_keyboard())
+
+
+@router.message(Command('scenarios'))
+async def scenarios_command(message: Message):
+    if not await _require_employee(message):
+        return
+    if not training_enabled():
+        await message.answer('Сценарии по курсу сейчас выключены. Начать обычную тренировку: /train')
+        return
+    from methodology.scenarios import SCENARIOS
+    await message.answer('Выберите ситуацию:\n' + '\n'.join(f"/train {s['id']} — {s['title']}" for s in SCENARIOS)
+                         + '\nКороткая отработка: /train возражения <название ситуации>')
+
+
+@router.message(Command('repeat'))
+async def repeat_command(message: Message):
+    actor = await _require_employee(message)
+    if actor is None:
+        return
+    if not training_enabled():
+        await message.answer('Повтор сценария по курсу сейчас выключен.')
+        return
+    await _launch(message, actor, topic='repeat', assigned_by=None)
 
 
 @router.callback_query(F.data.startswith('train_mode:'))
@@ -287,6 +339,7 @@ async def voice_turn(message: Message):
         file = await message.bot.get_file(message.voice.file_id)
         buf = await message.bot.download_file(file.file_path)
         raw_transcript, _dur = await dg_transcribe_bytes(buf.read())
+        await course_training.record_audio_cost(PG_POOL, session['id'], _dur / 60 * training_simulator.DG_PRICE_PER_MIN_USD)
         manager_text = training_simulator.strip_speaker_tags(raw_transcript) or '(не удалось распознать речь)'
     except Exception:
         log.exception('ошибка распознавания голосового сообщения, session id=%s', session['id'])

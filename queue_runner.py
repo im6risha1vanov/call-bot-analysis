@@ -82,7 +82,7 @@ async def reset_orphaned(pool: asyncpg.Pool) -> None:
         await hook(pool)
 
 
-async def claim_next(pool: asyncpg.Pool) -> asyncpg.Record | None:
+async def claim_next(pool: asyncpg.Pool, task_types: list[str] | None = None) -> asyncpg.Record | None:
     if not _REGISTRY:
         return None
     async with pool.acquire() as conn:
@@ -96,7 +96,7 @@ async def claim_next(pool: asyncpg.Pool) -> asyncpg.Record | None:
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
                 """,
-                list(_REGISTRY.keys()),
+                task_types if task_types is not None else list(_REGISTRY.keys()),
             )
             if row:
                 await conn.execute("UPDATE tasks SET status='processing', updated_at=now() WHERE id=$1", row["id"])
@@ -122,9 +122,9 @@ async def _fail_or_retry(pool: asyncpg.Pool, task: asyncpg.Record, exc: Exceptio
     )
 
 
-async def run_once(pool: asyncpg.Pool) -> bool:
+async def run_once(pool: asyncpg.Pool, task_types: list[str] | None = None) -> bool:
     """Возвращает True, если задача была найдена (успешно обработана или нет)."""
-    task = await claim_next(pool)
+    task = await claim_next(pool, task_types)
     if task is None:
         return False
 
@@ -166,18 +166,32 @@ async def main() -> None:
     # Импорт регистрирует обработчики декоратором @register — сам раннер про
     # конкретные типы задач ничего не знает.
     import handlers.analyze_call  # noqa: F401
+    import handlers.evaluate_course  # noqa: F401
     import handlers.oversight_report  # noqa: F401
     import handlers.rop_digest  # noqa: F401
 
     pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=5)
     await reset_orphaned(pool)
     log.info("queue runner started, обработчики: %s", sorted(_REGISTRY))
+    async def course_loop():
+        while True:
+            try:
+                handled = await run_once(pool, ['evaluate_course'])
+            except Exception:
+                log.exception('ошибка параллельного цикла методики курса')
+                handled = False
+            if not handled:
+                await asyncio.sleep(POLL_INTERVAL_SEC)
+    course_task = asyncio.create_task(course_loop())
+    original_types = [kind for kind in _REGISTRY if kind != 'evaluate_course']
     try:
         while True:
-            handled = await run_once(pool)
+            handled = await run_once(pool, original_types)
             if not handled:
                 await asyncio.sleep(POLL_INTERVAL_SEC)
     finally:
+        course_task.cancel()
+        await asyncio.gather(course_task, return_exceptions=True)
         await pool.close()
 
 

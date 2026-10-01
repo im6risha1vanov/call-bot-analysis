@@ -1,0 +1,12 @@
+{
+  "version": "draft_2026-10-01",
+  "owner": null,
+  "effective_from": null,
+  "status": "awaiting_approval",
+  "source": "User-provided course analysis dated 2026-10-01; not a commercial approval",
+  "records": [
+    {"id": "gck", "product": "gck", "label": "ГЦК", "unit": "phone_number", "package": null, "call_center": null, "replacement_mode": null, "tax": null, "price": null, "launch_conditions": null, "demo": null, "guarantee": null, "installment": null, "data_origin": null, "owner": null, "effective_from": null, "approved": false, "source": "https://antitreningi.ru/student/lessons/lesson?course_id=376252&lesson_id=8118482"},
+    {"id": "ops", "product": "ops", "label": "Определитель посетителей сайта", "unit": null, "package": null, "call_center": null, "replacement_mode": null, "tax": null, "price": null, "launch_conditions": null, "demo": null, "guarantee": null, "installment": null, "data_origin": null, "owner": null, "effective_from": null, "approved": false, "source": "https://antitreningi.ru/student/lessons/lesson?course_id=376252&lesson_id=8118493"},
+    {"id": "voice_robot", "product": "voice_robot", "label": "Голосовой робот", "unit": null, "package": null, "call_center": null, "replacement_mode": null, "tax": null, "price": null, "launch_conditions": null, "demo": null, "guarantee": null, "installment": null, "data_origin": null, "owner": null, "effective_from": null, "approved": false, "source": "https://antitreningi.ru/student/lessons/lesson?course_id=376252&lesson_id=8118531"}
+  ]
+}

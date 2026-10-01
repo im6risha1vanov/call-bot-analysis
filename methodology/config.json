@@ -1,0 +1,8 @@
+{
+  "mode": "shadow",
+  "version": "course_2025_v1",
+  "classification_min_confidence": 0.75,
+  "calibrated": false,
+  "training_enabled": true,
+  "daily_budget_units": 200000
+}

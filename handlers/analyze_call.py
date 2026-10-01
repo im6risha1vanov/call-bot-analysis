@@ -188,4 +188,9 @@ async def analyze_call(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
     except Exception:
         log.exception("ошибка немедленной доставки, call id=%s", call["id"])
 
+    try:
+        from methodology.jobs import enqueue
+        await enqueue(pool, call['client_id'], 'call', call['id'], transcript)
+    except Exception:
+        log.exception('не удалось поставить параллельную оценку, call id=%s', call['id'])
     return {"call_id": call["id"], "level": level, "cost_units": cost}

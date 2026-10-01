@@ -24,3 +24,17 @@ Private GitHub repo (done): https://github.com/im6risha1vanov/call-bot-analysis 
 - SQLite and manual recording upload stripped (`029e294`).
 - Employee sync moved to `astra_worker.sync_all_employees()`.
 - Private GitHub backup published: https://github.com/im6risha1vanov/call-bot-analysis (`main`, code snapshot `fb52e30`).
+
+## Актуальное дополнение: 1 октября 2026
+
+Пользователь поручил внедрить методику из предоставленного анализа курса
+«Новое обучение для мпп 2025» и проверить возврат исходной версии одной командой.
+Внедрение выполняется в `feat/course-methodology-2026-10`: параллельная оценка,
+предметные сценарии двух режимов, отдельное хранение и расход, защита от повторной
+оплаты и внешний контроллер отката. Исходный суточный лимит 2 000 000 не меняется.
+Сводки и автоматические назначения остаются на исходной шкале.
+
+Дальнейшая продуктовая работа: утверждение коммерческого каталога и экспертная
+калибровка на звонках всех ролей/этапов; затем отдельное переключение решений.
+Технические инструкции, проверки и контекст:
+[METHODOLOGY_IMPLEMENTATION.md](METHODOLOGY_IMPLEMENTATION.md).

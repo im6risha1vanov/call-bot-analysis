@@ -236,11 +236,15 @@ def _to_claude_messages(transcript: list[dict]) -> list[dict]:
 
 
 async def start_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
-                         assigned_by: str | None) -> asyncpg.Record:
+                         assigned_by: str | None, assignment_id: int | None = None) -> asyncpg.Record:
     """Создаёт сессию и генерирует первую (клиентскую) реплику. Не проверяет
     лимиты — вызывающий код (training_bot.py) обязан проверить get_active_session
     и sessions_today ДО вызова, чтобы дать пользователю понятное сообщение,
     а не проглатывать отказ здесь."""
+    from methodology.runtime import training_enabled
+    if training_enabled():
+        from methodology.training import start
+        return await start(pool, actor, topic, assigned_by, 'dialog', assignment_id)
     scenario_kind, scenario = await pick_scenario(pool, actor.client_id, actor_key(actor), topic)
     system_text = _system_prompt(scenario)
 
@@ -287,6 +291,9 @@ class TurnResult:
 async def handle_manager_turn(pool: asyncpg.Pool, session: asyncpg.Record, manager_text: str) -> TurnResult:
     """Один обмен репликами. manager_text уже расшифрован (Deepgram для
     голоса, как есть для текста) и очищен от разметки диаризации."""
+    from methodology.training import context, turn
+    if await context(pool, session['id']):
+        return await turn(pool, session, manager_text)
     transcript: list[dict] = json.loads(session["transcript"])
     transcript.append({"role": "manager", "text": manager_text})
     turns_count = session["turns_count"] + 1
@@ -378,9 +385,13 @@ comment — не длиннее 20 слов, конкретно про этот 
 
 
 async def start_drill_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
-                               assigned_by: str | None) -> asyncpg.Record:
+                               assigned_by: str | None, assignment_id: int | None = None) -> asyncpg.Record:
     """Лимиты (активная сессия, штук в день) проверяет вызывающий код — как и
     для режима разговора."""
+    from methodology.runtime import training_enabled
+    if training_enabled():
+        from methodology.training import start
+        return await start(pool, actor, topic, assigned_by, 'drill', assignment_id)
     objections = random.sample(OBJECTIONS, min(DRILL_SIZE, len(OBJECTIONS)))
     drill_state = {"objections": objections, "results": []}
 
@@ -421,6 +432,9 @@ async def _judge_answer(objection: str, answer: str) -> tuple[bool, str, float]:
 
 
 async def handle_drill_turn(pool: asyncpg.Pool, session: asyncpg.Record, manager_text: str) -> TurnResult:
+    from methodology.training import context, turn
+    if await context(pool, session['id']):
+        return await turn(pool, session, manager_text)
     drill_state = json.loads(session["drill_state"])
     objections: list[str] = drill_state["objections"]
     results: list[dict] = drill_state["results"]
@@ -495,6 +509,10 @@ async def end_session_early(pool: asyncpg.Pool, session: asyncpg.Record) -> tupl
     прогресс считается по тому же правилу, что и всегда. Но если он не ответил
     ни разу — оценивать нечего, помечаем сессию брошенной, чтобы она не портила
     статистику нулём."""
+    from methodology.training import context, turn
+    if await context(pool, session['id']):
+        result = await turn(pool, session, stop=True)
+        return result.reply_text or result.note or 'Тренировка обрабатывается.', None
     if session["mode"] == "drill":
         drill_state = json.loads(session["drill_state"])
         if not drill_state.get("results"):

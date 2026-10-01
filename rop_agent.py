@@ -29,6 +29,8 @@ import asyncpg
 from anthropic import AsyncAnthropic
 
 import tools
+from methodology.tools import SCHEMAS as COURSE_SCHEMAS, get_course_evaluation, get_course_stats
+from methodology.runtime import shadow_enabled
 from tools import Actor, Forbidden
 
 log = logging.getLogger("rop_agent")
@@ -122,9 +124,15 @@ manager_extension) — предложение по одной цитате от 
 половины времени; прошёл секретаря."""
 
 
-def _system_prompt(today_iso: str, tz_name: str) -> str:
+def _system_prompt(today_iso: str, tz_name: str, *, allow_course=False) -> str:
     return (
         SYSTEM_PROMPT_STATIC
+        + ("\nМетодика курса работает параллельно. Для её наблюдений используй get_course_evaluation/get_course_stats. "
+           "Не смешивай их с исходными баллами, не строй рейтинги и не объявляй общий навык менеджера доказанным по отдельной цитате. "
+           "Условия без утверждённого источника неизвестны, не выдавай внутренний учебный прайс клиентам. "
+           "Ситуационные вопросы, краткая зацепка, уместная презентация и согласованное КП допустимы для своего этапа. "
+           "Для тренировки можно назначить тему по названию ситуации из /scenarios."
+           if allow_course and shadow_enabled() else '')
         + f"\n\nСегодняшняя дата: {today_iso} (часовой пояс {tz_name}). Все относительные "
         + "периоды («этот месяц», «на прошлой неделе», «вчера», «в этом году») считай от "
         + "неё, а не от даты своего обучения — иначе получишь несуществующий период и пустые данные."
@@ -150,9 +158,11 @@ VERIFY_CONCLUSION_SCHEMA = {
     },
 }
 
-TOOLS = tools.TOOL_SCHEMAS + [VERIFY_CONCLUSION_SCHEMA]
+TOOLS = tools.TOOL_SCHEMAS + COURSE_SCHEMAS + [VERIFY_CONCLUSION_SCHEMA]
 
 _TOOL_FUNCS = {
+    'get_course_evaluation': get_course_evaluation,
+    'get_course_stats': get_course_stats,
     "get_stats": tools.get_stats,
     "find_calls": tools.find_calls,
     "get_call": tools.get_call,
@@ -225,7 +235,9 @@ async def _verify_conclusion(pool: asyncpg.Pool, actor: Actor, claim: str, suppo
 
 
 async def _dispatch_tool(pool: asyncpg.Pool, actor: Actor, name: str, tool_input: dict,
-                          verified: set[str]):
+                          verified: set[str], *, allow_course=False):
+    if name in {'get_course_evaluation','get_course_stats'} and not allow_course:
+        raise Forbidden('Методика курса не используется в автоматических сводках.')
     if name == "verify_conclusion":
         return await _verify_conclusion(
             pool, actor, tool_input.get("claim", ""), tool_input.get("supporting_data", ""),
@@ -257,7 +269,7 @@ async def _mentioned_unverified_managers(pool: asyncpg.Pool, actor: Actor, text:
     return hit
 
 
-async def answer(pool: asyncpg.Pool, actor: Actor, question: str) -> str:
+async def answer(pool: asyncpg.Pool, actor: Actor, question: str, *, allow_course=False) -> str:
     """Единая точка входа: и для свободных вопросов в Telegram, и для
     плановых дайджестов (см. handlers/rop_digest.py) — им соответствует
     заранее заготовленный текст question вместо вопроса живого человека."""
@@ -267,7 +279,8 @@ async def answer(pool: asyncpg.Pool, actor: Actor, question: str) -> str:
     client = await pool.fetchrow("SELECT timezone FROM clients WHERE id=$1", actor.client_id)
     tz_name = client["timezone"] if client else "Europe/Moscow"
     today_iso = datetime.now(ZoneInfo(tz_name)).date().isoformat()
-    system_text = _system_prompt(today_iso, tz_name)
+    course_allowed = allow_course and shadow_enabled()
+    system_text = _system_prompt(today_iso, tz_name, allow_course=course_allowed)
 
     messages: list[dict] = [{"role": "user", "content": question}]
     verified: set[str] = set()
@@ -277,7 +290,7 @@ async def answer(pool: asyncpg.Pool, actor: Actor, question: str) -> str:
         resp = await claude.messages.create(
             model=MODEL, max_tokens=2000, thinking={"type": "disabled"},
             system=[{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}],
-            tools=TOOLS, messages=messages,
+            tools=TOOLS if course_allowed else tools.TOOL_SCHEMAS+[VERIFY_CONCLUSION_SCHEMA], messages=messages,
         )
         await _add_spend(pool, actor.client_id, _cost_of(resp.usage))
         messages.append({"role": "assistant", "content": resp.content})
@@ -308,7 +321,7 @@ async def answer(pool: asyncpg.Pool, actor: Actor, question: str) -> str:
             if ext and block.name != "verify_conclusion":
                 candidates.add(ext)
             try:
-                result = await _dispatch_tool(pool, actor, block.name, block_input, verified)
+                result = await _dispatch_tool(pool, actor, block.name, block_input, verified, allow_course=course_allowed)
                 content = json.dumps(result, ensure_ascii=False, default=str)
             except Forbidden as exc:
                 content = json.dumps({"error": str(exc)}, ensure_ascii=False)

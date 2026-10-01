@@ -57,3 +57,11 @@ Postgres tables include `clients`, `employees`, `calls`, `astra_analysis`, `astr
 - Push or patch `/opt/callbot` as if it were production
 - Commit `.env`, venv, keys, credentials, call recordings, sqlite dumps
 - Print `.env` values
+
+## Дополнение: 1 октября 2026
+
+Добавлена версия методики `course_2025_v1` в режиме `shadow`; исходный результат
+сохраняется отдельно. Новые данные находятся в `methodology_evaluations`,
+`methodology_training_context`, `methodology_daily_spend`. Условия каталога пока
+не утверждены, числовые веса не калиброваны. Детали и ограничения:
+[METHODOLOGY_IMPLEMENTATION.md](METHODOLOGY_IMPLEMENTATION.md).

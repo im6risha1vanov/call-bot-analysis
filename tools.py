@@ -161,6 +161,8 @@ def _drill_summary(drill_state_json) -> dict | None:
     if not drill_state_json:
         return None
     results = (json.loads(drill_state_json) or {}).get("results") or []
+    if (json.loads(drill_state_json) or {}).get('version'):
+        return {'answered': len(results), 'graded': False, 'methodology_version': (json.loads(drill_state_json) or {})['version']}
     return {
         "passed": sum(1 for r in results if r.get("passed")),
         "total": len(results),
@@ -417,9 +419,9 @@ async def get_training_history(pool: asyncpg.Pool, actor: Actor, manager_extensi
     limit = min(int(limit), 50)
     rows = await pool.fetch(
         """
-        SELECT id, extension, scenario_kind, topic, status, level, score, turns_count,
-               mode, drill_state, started_at, ended_at
-        FROM training_sessions
+        SELECT t.id, extension, scenario_kind, topic, status, level, score, turns_count,
+               mode, drill_state, started_at, ended_at, mc.version AS methodology_version
+        FROM training_sessions t LEFT JOIN methodology_training_context mc ON mc.session_id=t.id
         WHERE client_id = $1 AND ($2::text IS NULL OR extension = $2)
           -- Пробные прогоны руководителя (он смотрит, годится ли тренажёр)
           -- в статистику отдела не идут: иначе агент считал бы их работой
@@ -432,6 +434,7 @@ async def get_training_history(pool: asyncpg.Pool, actor: Actor, manager_extensi
     return [
         {
             "session_id": r["id"], "manager_extension": r["extension"],
+            "methodology_version": r['methodology_version'] or 'legacy_52e4d575',
             "scenario": SCENARIO_LABELS.get(r["scenario_kind"], r["scenario_kind"]),
             "topic": r["topic"],
             "status": SESSION_STATUS_LABELS.get(r["status"], r["status"]),
