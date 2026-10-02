@@ -36,13 +36,35 @@ def intro(item, mode):
 
 def exercise_opening(item):
     # Display contextual facts already known before the objection; do not pretend this is a first call.
-    visible = {k: v for k, v in item['facts'].items() if k in {'offer', 'result', 'payment', 'sources', 'role'}}
-    return (f"Упражнение {item['exercise']}: {item['title']}. {item['variant']}.\n"
-            + (f"Роль: {ROLE_LABELS[item['role']]}; продукт: {PRODUCT_LABELS[item['product']]}. "
-               if item.get('mixed_drill') else '')
-            + f"Этап: {STAGE_LABELS[item['stage']]}. "
-            + ("Контекст: " + json.dumps(visible, ensure_ascii=False) + ". " if visible else "")
-            + "Клиент: «" + item['objection'] + "»")
+    labels = {'offer': 'Предложение', 'result': 'Результат услуги', 'payment': 'Оплата',
+              'sources': 'Источники', 'role': 'Собеседник'}
+    parts = [f"⚡ Упражнение {item['exercise']}: {item['title']}"]
+    if item['variant'] != 'обычная ситуация':
+        parts.append(f"Обстоятельства: {item['variant']}.")
+    details = []
+    if item.get('mixed_drill'):
+        details.extend([f"Роль: {ROLE_LABELS[item['role']]}", f"Продукт: {PRODUCT_LABELS[item['product']]}"])
+    details.append(f"Этап: {STAGE_LABELS[item['stage']]}")
+    parts.append('\n'.join(details))
+    known = []
+    for key, label in labels.items():
+        if key not in item['facts']:
+            continue
+        value = item['facts'][key]
+        if value is None:
+            text = 'не уточнено'
+        elif isinstance(value, bool):
+            text = 'да' if value else 'нет'
+        elif isinstance(value, (str, int, float)):
+            text = str(value).strip()
+        else:
+            text = 'условия нужно уточнить'
+        if text:
+            known.append(f'• {label}: {text.rstrip(".")}.')
+    if known:
+        parts.append('Что уже известно:\n' + '\n'.join(known))
+    parts.append('Клиент: «' + item['objection'] + '»')
+    return '\n\n'.join(parts)
 
 
 async def previous_session(pool, actor):
