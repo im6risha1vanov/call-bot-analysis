@@ -151,7 +151,7 @@ class InteractionTests(unittest.IsolatedAsyncioTestCase):
             for item in scenarios.SCENARIOS:
                 await bot.menu_callback(self.callback(f"tm:r:{code}:{item['id']}"))
                 start = self.start if mode == 'dialog' else self.drill
-                self.assertEqual(start.await_args.args, (self.pool, self.actor, item['id'], None, None))
+                self.assertEqual(start.await_args.args, (self.pool, self.actor, item['id'] if mode == 'dialog' else None, None, None))
         self.assertEqual(self.start.await_count, len(scenarios.SCENARIOS))
         self.assertEqual(self.drill.await_count, len(scenarios.SCENARIOS))
         self.assertEqual(self.ack.await_count, 2 * len(scenarios.SCENARIOS))
@@ -225,15 +225,35 @@ class InteractionTests(unittest.IsolatedAsyncioTestCase):
         self.tts.assert_awaited_once_with('Это дорого для нас.')
 
     async def test_pagination_edits_same_message_preserves_mode_and_home(self):
-        for data in ['tm:p:o:1', 'tm:p:o:2', 'tm:p:o:1', 'tm:p:o:0']:
+        for data in ['tm:p:d:1', 'tm:p:d:2', 'tm:p:d:1', 'tm:p:d:0']:
             await bot.menu_callback(self.callback(data))
-            self.assertIn('Короткая отработка', self.edit.await_args.args[0])
+            self.assertIn('Разговор целиком', self.edit.await_args.args[0])
         self.assertEqual(self.edit.await_count, 4)
         self.assertEqual(self.answer.await_count, 0)
         await bot.menu_callback(self.callback('tm:h'))
         self.assertIsInstance(self.answer.await_args.kwargs['reply_markup'], menu.ReplyKeyboardMarkup)
         self.start.assert_not_awaited()
         self.drill.assert_not_awaited()
+
+    async def test_short_button_launches_immediately_without_catalog(self):
+        await bot.router.propagate_event('message', self.message(menu.DRILL), bot=self.telegram)
+        self.drill.assert_awaited_once_with(self.pool, self.actor, None, None, None)
+        self.assertFalse(any(isinstance(c.kwargs.get('reply_markup'), menu.InlineKeyboardMarkup)
+                             and any(b.callback_data.startswith('tm:r:') for row in c.kwargs['reply_markup'].inline_keyboard for b in row)
+                             for c in self.answer.await_args_list))
+        self.provider.assert_not_awaited()
+
+    async def test_old_short_catalog_navigation_no_longer_offers_scenarios(self):
+        await bot.menu_callback(self.callback('tm:p:o:1'))
+        self.edit.assert_not_awaited()
+        self.drill.assert_not_awaited()
+        self.assertIn('без выбора ситуации', self.answer.await_args.args[0])
+
+    async def test_repeat_preserves_short_mode(self):
+        self.pool.fetchrow.return_value = {'mode': 'drill'}
+        await bot.repeat_command(self.message('/repeat'))
+        self.drill.assert_awaited_once_with(self.pool, self.actor, 'repeat', None, None)
+        self.start.assert_not_awaited()
 
     async def test_existing_session_blocks_start_catalog_repeat_and_new_scenario(self):
         self.active.return_value = self.session

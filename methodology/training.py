@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
+from random import sample
 from datetime import datetime, timedelta, timezone
 
 from .jobs import enqueue
@@ -20,6 +22,9 @@ def transcript_text(turns):
 
 
 def intro(item, mode):
+    if item.get('mixed_drill'):
+        return ('Пять коротких отработок: разные ситуации в случайном порядке. '
+                'На каждое возражение ответьте голосом или текстом. Разбор — после завершения.')
     return (f"{item['title']}. Ваша роль: {ROLE_LABELS[item['role']]}; "
             f"продукт: {PRODUCT_LABELS[item['product']]}; этап: {STAGE_LABELS[item['stage']]}.\n"
             f"Задача: {item['goal']}.\n"
@@ -33,21 +38,34 @@ def exercise_opening(item):
     # Display contextual facts already known before the objection; do not pretend this is a first call.
     visible = {k: v for k, v in item['facts'].items() if k in {'offer', 'result', 'payment', 'sources', 'role'}}
     return (f"Упражнение {item['exercise']}: {item['title']}. {item['variant']}.\n"
-            f"Этап: {STAGE_LABELS[item['stage']]}. "
+            + (f"Роль: {ROLE_LABELS[item['role']]}; продукт: {PRODUCT_LABELS[item['product']]}. "
+               if item.get('mixed_drill') else '')
+            + f"Этап: {STAGE_LABELS[item['stage']]}. "
             + ("Контекст: " + json.dumps(visible, ensure_ascii=False) + ". " if visible else "")
             + "Клиент: «" + item['objection'] + "»")
 
 
-async def pick(pool, actor, topic):
-    if topic == 'repeat':
-        previous = await pool.fetchrow("""SELECT mc.scenario FROM methodology_training_context mc
+async def previous_session(pool, actor):
+    return await pool.fetchrow("""SELECT mc.scenario,t.mode FROM methodology_training_context mc
             JOIN training_sessions t ON t.id=mc.session_id WHERE t.client_id=$1 AND t.extension=$2
             AND mc.telegram_user_id=$3 AND mc.version=$4 AND t.status='completed'
             ORDER BY t.id DESC LIMIT 1""",
             actor.client_id, actor.extension or '', actor.telegram_user_id, VERSION)
+
+
+async def pick(pool, actor, topic):
+    if topic == 'repeat':
+        previous = await previous_session(pool, actor)
         if previous:
             item = json.loads(previous['scenario'])
             repeat = item.get('repeat_number', 0) + 1
+            if item.get('mixed_drill'):
+                changed = deepcopy(item)
+                changed['exercises'] = [variants(exercise)[repeat % 5] for exercise in item['exercises']]
+                for n, exercise in enumerate(changed['exercises'], 1):
+                    exercise['exercise'] = n
+                changed['repeat_number'] = repeat
+                return changed
             changed = variants(item)[repeat % 5]
             changed['repeat_number'] = repeat
             return changed
@@ -74,10 +92,26 @@ async def pick(pool, actor, topic):
     return find('owner_minute')
 
 
+def mixed_drill(size):
+    candidates = [s for s in SCENARIOS if s.get('objection')]
+    if not candidates:
+        raise TrainingLimit('Короткие отработки сейчас недоступны.')
+    exercises = []
+    for n, scenario in enumerate(sample(candidates, min(size, len(candidates))), 1):
+        exercise = variants(scenario)[0]
+        exercise.update(exercise=n, mixed_drill=True)
+        exercises.append(exercise)
+    return {'id': 'mixed_drill', 'title': 'Короткая отработка: разные ситуации',
+            'role': 'unknown', 'stage': 'unknown', 'product': 'unknown', 'facts': {},
+            'goal': 'Ответить на разные возражения', 'opening': exercise_opening(exercises[0]),
+            'skills': sorted({skill for e in exercises for skill in e['skills']}),
+            'synthetic': True, 'mixed_drill': True, 'exercises': exercises}
+
+
 async def start(pool, actor, topic, assigned_by, mode, assignment_id=None):
     import training_simulator as old
-    item = await pick(pool, actor, topic)
-    exercises = variants(item) if mode == 'drill' else []
+    item = mixed_drill(old.DRILL_SIZE) if mode == 'drill' and not topic else await pick(pool, actor, topic)
+    exercises = (item['exercises'] if item.get('mixed_drill') else variants(item)) if mode == 'drill' else []
     item['exercises'] = exercises
     opening = exercise_opening(exercises[0]) if exercises else item['opening']
     # A transaction-scoped lock prevents concurrent /train clicks before any paid work.

@@ -102,13 +102,17 @@ def verify_claim(raw, transcript, commercial_catalog):
     return claim
 
 
-def evaluate(raw: dict, transcript: str, *, config=None, commercial_catalog=None) -> dict:
+def evaluate(raw: dict, transcript: str, *, config=None, commercial_catalog=None, training_exercises=None) -> dict:
     if not isinstance(raw, dict):
         raise InvalidEvaluation("Model response must be an object")
     config = config or settings()
     classification = raw.get("classification")
     if not isinstance(classification, dict):
         raise InvalidEvaluation("Classification is required")
+    mixed_drill = bool(training_exercises) and all(e['scenario'].get('mixed_drill') for e in training_exercises)
+    if mixed_drill:
+        classification = {**classification, 'sales_role': 'unknown', 'product': 'unknown', 'stage': 'unknown',
+                          'confidence': 0, 'evidence': [], 'reason': 'Независимые упражнения разных профилей'}
     role, product, stage = (classification.get(k) for k in ("sales_role", "product", "stage"))
     if role not in ROLES or product not in PRODUCTS or stage not in STAGES:
         raise InvalidEvaluation("Unknown role/product/stage")
@@ -213,17 +217,31 @@ def evaluate(raw: dict, transcript: str, *, config=None, commercial_catalog=None
         raise InvalidEvaluation('Exercise results must contain at most five items')
     checked_exercises = []
     seen = set()
+    exercise_contexts = {e['scenario']['exercise']: e for e in (training_exercises or [])}
     for exercise in exercises:
         if not isinstance(exercise, dict) or type(exercise.get('exercise')) is not int or not 1 <= exercise['exercise'] <= 5 or exercise['exercise'] in seen:
             raise InvalidEvaluation('Invalid exercise index')
         seen.add(exercise['exercise'])
+        exercise_titles, exercise_transcript, metadata = titles, transcript, {}
+        if training_exercises is not None:
+            source = exercise_contexts.get(exercise['exercise'])
+            if not source:
+                raise InvalidEvaluation('Exercise must match an answered exercise')
+            scenario = source['scenario']
+            if scenario['role'] not in ROLES or scenario['stage'] not in STAGES or scenario['product'] not in PRODUCTS:
+                raise InvalidEvaluation('Invalid pinned exercise profile')
+            exercise_titles = criteria_for(scenario['role'], scenario['stage'], True)
+            exercise_transcript = 'Клиент: ' + source['objection'] + '\nМенеджер: ' + source['answer']
+            metadata = {'scenario_title': scenario['title'], 'sales_role': scenario['role'],
+                        'product': scenario['product'], 'stage': scenario['stage']}
         criterion = exercise.get('criterion')
-        if criterion not in titles:
+        if criterion not in exercise_titles:
             raise InvalidEvaluation('Exercise criterion must be applicable to its profile')
-        checked_exercises.append({'exercise': exercise['exercise'], 'criterion': criterion, 'title': titles[criterion],
-                                  **validate_criterion(exercise, transcript),
+        checked_exercises.append({'exercise': exercise['exercise'], 'criterion': criterion, 'title': exercise_titles[criterion],
+                                  **metadata, **validate_criterion(exercise, exercise_transcript),
                                   'say_instead': _text(exercise.get('say_instead'), 'exercise.say_instead', 600)})
     return {"methodology_version": VERSION, "catalog_version": (commercial_catalog or approved_catalog())["version"],
+            "mixed_drill": mixed_drill,
             "classification": classification, "narrow_profile_applied": confident, "rows": rows,
             "quality": {"counts": counts, "observed": measured, "score": None, "level": None,
                         "calibrated": False, "coverage": round(measured / len(rows), 3) if rows else 0},
@@ -246,12 +264,15 @@ def score_prompt() -> str:
 
 def render(result: dict, detailed=False) -> str:
     c = result["classification"]; counts = result["quality"]["counts"]
-    lines = [f"{ROLE_LABELS[c['sales_role']]} · {PRODUCT_LABELS[c['product']]} · {STAGE_LABELS[c['stage']]}",
+    lines = ['Короткая отработка: разные ситуации' if result.get('mixed_drill') else
+             f"{ROLE_LABELS[c['sales_role']]} · {PRODUCT_LABELS[c['product']]} · {STAGE_LABELS[c['stage']]}",
              f"Качество: выполнено {counts['passed']}, не выполнено {counts['failed']}, "
              f"недостаточно данных {counts['insufficient_data']}, неприменимо {counts['not_applicable']}.",
              f"Результат: {result['outcome']['description'] or 'не описан'}.",
              "Следующий шаг подтверждён." if result["outcome"]["confirmed"] else "Подтверждённый следующий шаг не установлен."]
-    if not result["narrow_profile_applied"]:
+    if result.get('mixed_drill'):
+        lines.append('Каждое упражнение оценено по его ситуации и этапу.')
+    elif not result["narrow_profile_applied"]:
         lines.append("Профиль определён неуверенно; проверены только общие навыки.")
     good = [r for r in result["rows"] if r["status"] == "passed"][:2]
     priority = {'factual_accuracy':0,'respectful_communication':1,'next_step':2}
@@ -273,7 +294,8 @@ def render(result: dict, detailed=False) -> str:
     if detailed:
         for exercise in result.get('exercise_results', []):
             label = {'passed':'выполнено','failed':'не выполнено','not_applicable':'неприменимо','insufficient_data':'недостаточно данных'}[exercise['status']]
-            lines.append(f"\nУпражнение {exercise['exercise']}, {exercise['title']}: {label}. {exercise['reason']}\n{exercise['evidence']}")
+            situation = ' — ' + exercise['scenario_title'] if exercise.get('scenario_title') else ''
+            lines.append(f"\nУпражнение {exercise['exercise']}{situation}, {exercise['title']}: {label}. {exercise['reason']}\n{exercise['evidence']}")
             if exercise['status'] == 'failed' and exercise['say_instead']:
                 lines.append('Попробуйте: ' + exercise['say_instead'])
         for row in result["rows"]:

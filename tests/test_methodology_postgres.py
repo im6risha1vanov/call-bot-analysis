@@ -162,6 +162,52 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(json.loads(row['drill_state'])['results']),5)
         self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM tasks'),1)
 
+    async def test_mixed_drill_pinned_varied_survives_reload_and_enqueues_once(self):
+        chosen=[training.find(key) for key in ('secretary','expensive','support','qualification','customer_sales')]
+        with patch.object(training,'sample',return_value=chosen):
+            session=await training.start(self.pool,self.actor,None,None,'drill')
+        context=json.loads((await training.context(self.pool,session['id']))['scenario'])
+        self.assertTrue(context['mixed_drill'])
+        self.assertEqual([e['id'] for e in context['exercises']], [e['id'] for e in chosen])
+        self.assertEqual(len({e['id'] for e in context['exercises']}),5)
+        for n in range(5):
+            reloaded=await self.pool.fetchrow('SELECT * FROM training_sessions WHERE id=$1',session['id'])
+            result=await training.turn(self.pool,reloaded,f'Ответ на упражнение {n+1}.')
+            if n<4:
+                self.assertEqual(result.speech_text,chosen[n+1]['objection'])
+        self.assertTrue(result.ended)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM tasks'),1)
+        repeated=await training.start(self.pool,self.actor,'repeat',None,'drill')
+        repeated_context=json.loads((await training.context(self.pool,repeated['id']))['scenario'])
+        self.assertEqual([e['id'] for e in repeated_context['exercises']], [e['id'] for e in chosen])
+        self.assertTrue(all(e['facts']['available_minutes']==1 for e in repeated_context['exercises']))
+        self.assertEqual([e['exercise'] for e in repeated_context['exercises']],[1,2,3,4,5])
+
+    async def test_mixed_drill_evaluation_keeps_all_exercise_profiles(self):
+        import handlers.evaluate_course as handler
+        from methodology.profiles import criteria_for
+        chosen=[training.find(key) for key in ('secretary','expensive','support','qualification','customer_sales')]
+        with patch.object(training,'sample',return_value=chosen):
+            session=await training.start(self.pool,self.actor,None,None,'drill')
+        raw=response();raw['exercise_results']=[]
+        for n, item in enumerate(chosen,1):
+            answer=f'Ответ на ситуацию {n}.'
+            await training.turn(self.pool,session,answer)
+            criterion=next(k for k in item['skills'] if k in criteria_for(item['role'],item['stage'],True))
+            raw['exercise_results'].append({'exercise':n,'criterion':criterion,'status':'passed',
+                                           'evidence':answer,'reason':'Предметный ответ','say_instead':''})
+        task=dict(await self.pool.fetchrow('SELECT * FROM tasks LIMIT 1'))
+        fake_provider=AsyncMock(return_value=(json.dumps(raw),3))
+        bot=SimpleNamespace(send_message=AsyncMock(),session=SimpleNamespace(close=AsyncMock()))
+        with patch.object(transport,'request',fake_provider),patch.object(handler,'Bot',return_value=bot):
+            await self.handler(self.pool,task)
+        saved=json.loads(await self.pool.fetchval('SELECT result FROM methodology_evaluations'))
+        self.assertTrue(saved['mixed_drill'])
+        self.assertEqual([e['stage'] for e in saved['exercise_results']],[e['stage'] for e in chosen])
+        self.assertTrue(all(e['status']=='passed' for e in saved['exercise_results']))
+        self.assertEqual(fake_provider.await_count,1)
+        self.assertEqual(len(fake_provider.await_args.args[2]['exercises']),5)
+
     async def test_concurrent_messages_and_stop_do_not_repeat_paid_turn(self):
         import training_simulator as old
         session=await training.start(self.pool,self.actor,'owner_minute',None,'dialog')

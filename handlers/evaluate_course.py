@@ -111,7 +111,8 @@ async def evaluate_course(pool, task):
     try:
         raw = json.loads(text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip(),
                          parse_constant=lambda value: (_ for _ in ()).throw(InvalidEvaluation("Nonfinite JSON number")))
-        result = evaluate(raw, transcript)
+        exercise_context = context['exercises'] if source == 'training' and item['mode'] == 'drill' and training_context else None
+        result = evaluate(raw, transcript, training_exercises=exercise_context)
         if source=='training' and item['mode']=='drill' and training_context and len(result['exercise_results']) != len(context['exercises']):
             raise InvalidEvaluation('Every answered course exercise requires an evaluation')
     except (InvalidEvaluation, ValueError, TypeError) as exc:

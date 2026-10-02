@@ -26,6 +26,38 @@ def grade(raw, transcript=TRANSCRIPT, catalog=CATALOG):
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_mixed_exercises_use_their_own_profiles_and_quotes(self):
+        selected = [find(key) for key in ('secretary','expensive','support','qualification','customer_sales')]
+        contexts, answers = [], []
+        raw = response()
+        raw['exercise_results'] = []
+        for n, item in enumerate(selected, 1):
+            item.update(exercise=n, mixed_drill=True)
+            answer = f'Уточняю задачу {n}.'
+            contexts.append({'scenario': item, 'objection': item['objection'], 'answer': answer})
+            answers.append(answer)
+            criterion = next(key for key in item['skills'] if key in profiles.criteria_for(item['role'], item['stage'], True))
+            raw['exercise_results'].append({'exercise':n,'criterion':criterion,'status':'passed',
+                                           'evidence':answer,'reason':'Предметный ответ','say_instead':''})
+        transcript = '\n'.join(answers)
+        result = evaluation.evaluate(raw, transcript, training_exercises=contexts, commercial_catalog=CATALOG)
+        self.assertTrue(result['mixed_drill'])
+        self.assertEqual({r['key'] for r in result['rows']}, set(profiles.COMMON))
+        self.assertEqual([e['stage'] for e in result['exercise_results']], [s['stage'] for s in selected])
+        self.assertTrue(all(e['status']=='passed' for e in result['exercise_results']))
+        self.assertIn('Секретарь и общая почта',evaluation.render(result,detailed=True))
+        raw['exercise_results'][0]['evidence'] = answers[1]
+        changed = evaluation.evaluate(raw, transcript, training_exercises=contexts, commercial_catalog=CATALOG)
+        self.assertEqual(changed['exercise_results'][0]['status'],'insufficient_data')
+
+    def test_mixed_exercise_rejects_criterion_from_another_profile(self):
+        item=find('secretary');item.update(exercise=1,mixed_drill=True)
+        source={'scenario':item,'objection':item['objection'],'answer':'Здравствуйте.'}
+        raw=response()
+        raw['exercise_results']=[{'exercise':1,'criterion':'economics','status':'passed','evidence':'Здравствуйте.','reason':''}]
+        with self.assertRaises(evaluation.InvalidEvaluation):
+            evaluation.evaluate(raw,'Здравствуйте.',training_exercises=[source])
+
     def test_all_six_profiles_and_three_roles(self):
         for role in profiles.ROLES - {'unknown'}:
             for stage in profiles.STAGES - {'unknown'}:
@@ -196,6 +228,19 @@ class EconomicsTests(unittest.TestCase):
 
 
 class ScenarioTests(unittest.TestCase):
+    def test_random_short_drills_use_current_registry_without_repeats(self):
+        from methodology import training
+        current = copy.deepcopy(SCENARIOS[:5])
+        current[-1].update(id='new_short_case',title='Новая короткая ситуация')
+        with patch.object(training,'SCENARIOS',current):
+            series = training.mixed_drill(5)
+        self.assertEqual({e['id'] for e in series['exercises']},{s['id'] for s in current})
+        self.assertEqual([e['exercise'] for e in series['exercises']],[1,2,3,4,5])
+        saved = next(e for e in series['exercises'] if e['id']==current[0]['id'])
+        original = saved['objection']
+        current[0]['objection']='Изменение реестра после запуска'
+        self.assertEqual(saved['objection'],original)
+
     def test_unique_ids_and_role_stage_coverage(self):
         self.assertEqual(len(SCENARIOS), len({s['id'] for s in SCENARIOS}))
         self.assertEqual({s['role'] for s in SCENARIOS}, profiles.ROLES - {'unknown'})

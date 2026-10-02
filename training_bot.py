@@ -68,7 +68,7 @@ def start_text():
         greeting = 'Тренажёр возражений: я играю клиента холодного звонка.'
     return (greeting + '\n\n'
             '🎯 Начать тренировку / 📋 Ситуации — выбрать ситуацию для полного разговора.\n'
-            '⚡ Короткая отработка — пять упражнений в выбранной ситуации.\n'
+            '⚡ Короткая отработка — сразу пять разных ситуаций в случайном порядке.\n'
             '🔁 Повторить — завершённая ситуация с изменёнными обстоятельствами.\n'
             '⏹ Завершить — сохранить ответы и закончить тренировку.\n'
             '❓ Помощь — показать эту подсказку.\n\n'
@@ -360,7 +360,9 @@ async def repeat_command(message: Message):
     if not training_enabled():
         await message.answer('Повтор сценария по курсу сейчас выключен.')
         return
-    await _launch(message, actor, topic='repeat', assigned_by=None)
+    previous = await course_training.previous_session(PG_POOL, actor)
+    mode = previous.get('mode', 'dialog') if previous else 'dialog'
+    await _launch(message, actor, topic='repeat', assigned_by=None, mode=mode)
 
 
 @router.callback_query(F.data.startswith('train_mode:'))
@@ -400,7 +402,11 @@ async def _handle_callback(cq: CallbackQuery, action):
             await cq.message.edit_text('Выберите действие в меню под полем ввода.', reply_markup=None)
             await help_command(cq.message)
         elif kind == 'p':
-            await _catalog(cq.message, actor, mode, value, edit=True)
+            if mode == 'drill':
+                await cq.message.answer('Короткая отработка запускается без выбора ситуации. '
+                                        'Нажмите «⚡ Короткая отработка».', reply_markup=menu.main_keyboard())
+            else:
+                await _catalog(cq.message, actor, mode, value, edit=True)
         elif kind == 's':
             await _stop(cq.message, actor, value, legacy_button=value is None)
         elif kind == 'c':
@@ -416,7 +422,7 @@ async def _handle_callback(cq: CallbackQuery, action):
                 await cq.message.answer('Сценарии по курсу сейчас выключены. Откройте «📋 Ситуации».',
                                         reply_markup=menu.main_keyboard())
                 return
-            await _launch(cq.message, actor, topic=value, assigned_by=None, mode=mode)
+            await _launch(cq.message, actor, topic=None if mode == 'drill' else value, assigned_by=None, mode=mode)
     except Exception:
         log.exception('ошибка кнопки тренажёра')
         await cq.message.answer('Не удалось выполнить действие. Попробуйте ещё раз или откройте меню через /help.')
@@ -427,7 +433,9 @@ async def menu_action(message: Message):
     if message.text in {menu.START, menu.SCENARIOS}:
         await _choose(message, 'dialog')
     elif message.text == menu.DRILL:
-        await _choose(message, 'drill')
+        actor = await _require_employee(message)
+        if actor is not None:
+            await _launch(message, actor, topic=None, assigned_by=None, mode='drill')
     elif message.text == menu.REPEAT:
         await repeat_command(message)
     elif message.text == menu.STOP:
