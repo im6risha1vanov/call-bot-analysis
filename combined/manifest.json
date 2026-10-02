@@ -1,0 +1,11 @@
+{
+  "version": "combined_2026_v1",
+  "course_sha256": "ef8e01677bc0a94b31ad6d5e432fce31c69db8c45782e284b9e9b733eba3363e",
+  "files": {
+    "__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "evaluation.py": "da2bafd0bc9143ebc56961da94d8e39cd19223b7d4e27085889a29708e418575",
+    "render.py": "c4ccabd297f37be7452e87ab8959a0ca8a4f7d2760dc89cae29cdf38536a7462",
+    "prompt.md": "3bbc968e8eb2d06b0b0c8e0bc70d458d6b8dba464db8f843b76398ce68da645e"
+  },
+  "sha256": "c31465f8c328a31cb944bbb1f1b217afe218e6e2e7009d66f236569beba4b870"
+}

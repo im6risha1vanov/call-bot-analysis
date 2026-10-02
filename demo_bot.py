@@ -66,13 +66,14 @@ async def start_command(message):
 @router.message(Command('help'))
 async def help_command(message):
     actor = await resolve_actor(PG_POOL, message.from_user.id) if PG_POOL else None
-    menu = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Сравнить методики')]], resize_keyboard=True, is_persistent=True) if actor and actor.role in {'head', 'owner'} else None
+    menu = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Сравнить методики'), KeyboardButton(text='Объединённый разбор')]], resize_keyboard=True, is_persistent=True) if actor and actor.role in {'head', 'owner'} else None
     await message.answer(
         'Звонки разбираются автоматически из Mango — присылать записи не нужно.\n\n'
         '<b>Команды</b>\n'
         '/check &lt;критерий&gt; [дней] — что модель увидела по критерию (руководителю)\n'
         '/assign_train &lt;добавочный&gt; [режим] — назначить тренировку в тренажёре (руководителю)\n'
         '/trainings — последние тренировки, /training &lt;номер&gt; — одна подробно\n'
+        '/combined_analysis — пробный объединённый разбор выбранных звонков (руководителю)\n'
         '/compare_analysis — сравнить две методики на двух последних звонках (руководителю)\n'
         '/methodology &lt;номер звонка&gt; — отдельный разбор по курсу\n'
         '/methodology_training &lt;номер&gt; — разбор тренировки по курсу\n'
@@ -570,6 +571,8 @@ async def methodology_stats_command(message: Message):
 
 from comparison.ui import install as install_comparison
 install_comparison(router, lambda: PG_POOL)
+from combined.ui import install as install_combined
+install_combined(router, lambda: PG_POOL)
 
 
 @router.message(F.text)

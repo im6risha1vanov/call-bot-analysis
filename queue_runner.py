@@ -168,6 +168,7 @@ async def main() -> None:
     import handlers.analyze_call  # noqa: F401
     import handlers.evaluate_course  # noqa: F401
     import handlers.compare_analysis  # noqa: F401
+    import handlers.combined_analysis  # noqa: F401
     import handlers.oversight_report  # noqa: F401
     import handlers.rop_digest  # noqa: F401
 
@@ -186,7 +187,7 @@ async def main() -> None:
     async def comparison_loop():
         while True:
             try:
-                handled = await run_once(pool, ['compare_analysis'])
+                handled = await run_once(pool, ['compare_analysis', 'combined_analysis'])
             except Exception:
                 log.exception('ошибка цикла сравнения методик')
                 handled = False
@@ -194,7 +195,7 @@ async def main() -> None:
                 await asyncio.sleep(POLL_INTERVAL_SEC)
     course_task = asyncio.create_task(course_loop())
     comparison_task = asyncio.create_task(comparison_loop())
-    original_types = [kind for kind in _REGISTRY if kind not in {'evaluate_course', 'compare_analysis'}]
+    original_types = [kind for kind in _REGISTRY if kind not in {'evaluate_course', 'compare_analysis', 'combined_analysis'}]
     try:
         while True:
             handled = await run_once(pool, original_types)
