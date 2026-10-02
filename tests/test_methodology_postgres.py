@@ -232,7 +232,7 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
             release.set();await first
         self.assertEqual(fake.await_count,1)
 
-    async def test_repeat_changes_circumstances_and_daily_limit_is_atomic(self):
+    async def test_repeat_changes_circumstances_and_fourth_session_is_allowed(self):
         first=await training.start(self.pool,self.actor,'owner_minute',None,'dialog')
         # Only answered, completed sessions are eligible for a repeat.
         await self.pool.execute("UPDATE training_sessions SET transcript=$2::jsonb WHERE id=$1", first['id'],
@@ -244,8 +244,18 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         await training.turn(self.pool,second,stop=True)
         third=await training.start(self.pool,self.actor,'owner_minute',None,'drill')
         await training.turn(self.pool,third,stop=True)
-        with self.assertRaises(training.TrainingLimit):
-            await training.start(self.pool,self.actor,'support',None,'dialog')
+        fourth=await training.start(self.pool,self.actor,'support',None,'dialog')
+        self.assertEqual(fourth['status'],'active')
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM training_sessions'),4)
+
+    async def test_no_daily_count_limit_in_both_modes(self):
+        for mode in ('dialog','drill'):
+            for _ in range(4):
+                session=await training.start(self.pool,self.actor,'support',None,mode)
+                self.assertEqual(session['status'],'active')
+                await training.turn(self.pool,session,stop=True)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM training_sessions'),8)
+        self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM training_sessions WHERE status='active'"),0)
 
     async def test_repeat_requires_completed_session_and_ignores_later_abandoned(self):
         abandoned=await training.start(self.pool,self.actor,'support',None,'dialog')

@@ -80,7 +80,7 @@ async def start(pool, actor, topic, assigned_by, mode, assignment_id=None):
     exercises = variants(item) if mode == 'drill' else []
     item['exercises'] = exercises
     opening = exercise_opening(exercises[0]) if exercises else item['opening']
-    # A transaction-scoped lock protects daily limits and concurrent /train clicks before any paid work.
+    # A transaction-scoped lock prevents concurrent /train clicks before any paid work.
     actor_lock = int.from_bytes(hashlib.sha256(f"course:{actor.client_id}:{actor.extension}".encode()).digest()[:8], 'big', signed=True)
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -88,11 +88,9 @@ async def start(pool, actor, topic, assigned_by, mode, assignment_id=None):
             if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM training_sessions WHERE client_id=$1 AND extension=$2 AND status='active')",
                                    actor.client_id, old.actor_key(actor)):
                 raise TrainingLimit('У вас уже есть незавершённая тренировка. Завершить: /stop')
-            client = await conn.fetchrow('SELECT timezone,processing_enabled FROM clients WHERE id=$1', actor.client_id)
+            client = await conn.fetchrow('SELECT processing_enabled FROM clients WHERE id=$1', actor.client_id)
             if not client or not client['processing_enabled']:
                 raise TrainingLimit('Обработка для вашей компании приостановлена.')
-            if await old.sessions_today(conn, actor.client_id, old.actor_key(actor), client['timezone']) >= old.MAX_SESSIONS_PER_DAY:
-                raise TrainingLimit('Дневной лимит тренировок исчерпан.')
             if assignment_id is not None:
                 assignment = await conn.fetchrow('SELECT id FROM pending_train_assignments WHERE id=$1 AND client_id=$2 AND extension=$3 AND consumed=false FOR UPDATE',
                                                  assignment_id, actor.client_id, old.actor_key(actor))

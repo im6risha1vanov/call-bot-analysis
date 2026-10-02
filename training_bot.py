@@ -164,13 +164,6 @@ async def _launch_session(message: Message, actor, topic, assigned_by, mode, ass
     if existing is not None:
         await _busy(message, existing)
         return
-    client = await PG_POOL.fetchrow('SELECT timezone FROM clients WHERE id=$1', actor.client_id)
-    tz_name = client['timezone'] if client else 'Europe/Moscow'
-    done_today = await training_simulator.sessions_today(PG_POOL, actor.client_id, training_simulator.actor_key(actor), tz_name)
-    if done_today >= training_simulator.MAX_SESSIONS_PER_DAY:
-        await message.answer(
-            f'Уже {done_today} тренировки сегодня — дневной лимит ({training_simulator.MAX_SESSIONS_PER_DAY}) исчерпан.')
-        return
     try:
         if mode == 'drill':
             session = await training_simulator.start_drill_session(PG_POOL, actor, topic, assigned_by, assignment_id)

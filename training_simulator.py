@@ -50,7 +50,6 @@ DG_PRICE_PER_MIN_USD = 0.0043  # справочно, как в handlers/analyze_
 MAX_TURNS = 20
 MAX_MINUTES = 15
 SESSION_BUDGET_USD = float(os.getenv("TRAIN_SESSION_BUDGET_USD", "0.50"))
-MAX_SESSIONS_PER_DAY = 3
 
 END_MARKER = "[КОНЕЦ]"
 
@@ -156,15 +155,6 @@ def strip_speaker_tags(transcript: str) -> str:
 
 # --------------------------------------------------------------- ограничения
 
-async def sessions_today(pool: asyncpg.Pool, client_id: int, extension: str, tz_name: str) -> int:
-    tz = ZoneInfo(tz_name)
-    start = datetime.combine(datetime.now(tz).date(), datetime.min.time(), tzinfo=tz)
-    return await pool.fetchval(
-        "SELECT count(*) FROM training_sessions WHERE client_id=$1 AND extension=$2 AND created_at >= $3",
-        client_id, extension, start,
-    )
-
-
 async def get_active_session(pool: asyncpg.Pool, actor: Actor) -> asyncpg.Record | None:
     """Руководителю тренажёр тоже доступен — чтобы он мог попробовать его сам и
     решить, годится ли инструмент для отдела. Сессия привязывается к его
@@ -238,8 +228,8 @@ def _to_claude_messages(transcript: list[dict]) -> list[dict]:
 async def start_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
                          assigned_by: str | None, assignment_id: int | None = None) -> asyncpg.Record:
     """Создаёт сессию и генерирует первую (клиентскую) реплику. Не проверяет
-    лимиты — вызывающий код (training_bot.py) обязан проверить get_active_session
-    и sessions_today ДО вызова, чтобы дать пользователю понятное сообщение,
+    активную сессию — вызывающий код (training_bot.py) обязан проверить get_active_session
+    ДО вызова, чтобы дать пользователю понятное сообщение,
     а не проглатывать отказ здесь."""
     from methodology.runtime import training_enabled
     if training_enabled():
@@ -386,7 +376,7 @@ comment — не длиннее 20 слов, конкретно про этот 
 
 async def start_drill_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
                                assigned_by: str | None, assignment_id: int | None = None) -> asyncpg.Record:
-    """Лимиты (активная сессия, штук в день) проверяет вызывающий код — как и
+    """Активную сессию проверяет вызывающий код — как и
     для режима разговора."""
     from methodology.runtime import training_enabled
     if training_enabled():

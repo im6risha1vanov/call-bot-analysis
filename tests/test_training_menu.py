@@ -96,7 +96,6 @@ class InteractionTests(unittest.IsolatedAsyncioTestCase):
         self.resolve = self.mock(bot, 'resolve_actor', AsyncMock(return_value=self.actor))
         self.mock(bot, 'training_enabled', lambda: True)
         self.active = self.mock(bot.training_simulator, 'get_active_session', AsyncMock(return_value=None))
-        self.today = self.mock(bot.training_simulator, 'sessions_today', AsyncMock(return_value=0))
         self.start = self.mock(bot.training_simulator, 'start_session', AsyncMock(return_value=self.session))
         self.drill = self.mock(bot.training_simulator, 'start_drill_session', AsyncMock(return_value={**self.session, 'mode': 'drill'}))
         self.stop = self.mock(bot.training_simulator, 'end_session_early', AsyncMock(return_value=('Ответы сохранены, разбор поставлен в очередь.', None)))
@@ -181,12 +180,7 @@ class InteractionTests(unittest.IsolatedAsyncioTestCase):
         await bot.menu_callback(self.callback('tm:c'))
         self.assertIn('Продолжайте отвечать', self.answer.await_args.args[0])
 
-    async def test_daily_limit_and_db_refusal_do_not_bypass_launch(self):
-        self.today.return_value = bot.training_simulator.MAX_SESSIONS_PER_DAY
-        await bot.menu_callback(self.callback('tm:r:d:secretary'))
-        self.start.assert_not_awaited()
-        self.assertIn('лимит', self.answer.await_args.args[0])
-        self.today.return_value = 0
+    async def test_db_refusal_does_not_bypass_launch(self):
         self.start.side_effect = training.TrainingLimit('Обработка приостановлена.')
         await bot.menu_callback(self.callback('tm:r:d:secretary'))
         self.assertIn('приостановлена', self.answer.await_args.args[0])
@@ -297,7 +291,7 @@ class InteractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_assignment_deep_link_keeps_client_extension_checks(self):
         assignment = {'extension': '101', 'client_id': 1, 'topic': 'secretary',
                       'assigned_by_telegram_user_id': 456, 'mode': 'drill'}
-        self.pool.fetchrow.side_effect = [assignment, {'timezone': 'UTC'}]
+        self.pool.fetchrow.side_effect = [assignment]
         await bot.start_command(self.message('/start train_5'), CommandObject(command='start', args='train_5'))
         self.drill.assert_awaited_once_with(self.pool, self.actor, 'secretary', '456', 5)
         self.pool.execute.assert_not_awaited()  # Course DB transaction owns assignment consumption.
