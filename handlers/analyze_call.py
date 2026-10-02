@@ -36,6 +36,9 @@ _bot = Bot(token=os.environ["BOT_TOKEN"])
 
 
 async def _over_daily_limit(pool: asyncpg.Pool, client: asyncpg.Record) -> bool:
+    from automatic.jobs import installed, over_budget
+    if await installed(pool):
+        return await over_budget(pool, client)
     spent = await pool.fetchval(
         "SELECT spent_units FROM astra_daily_spend WHERE client_id=$1 AND day=$2",
         client["id"], datetime.now(ZoneInfo(client["timezone"])).date(),
@@ -66,6 +69,7 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
     if level is None:
         return
 
+    sent = await pool.fetchrow('SELECT immediate_sent_manager,immediate_sent_head FROM astra_analysis WHERE call_id=$1',call['id'])
     call_time = fmt_call_time(call["call_started_at"], client["timezone"])
 
     manager = await pool.fetchrow(
@@ -77,7 +81,7 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
     # нужен, чтобы не заваливать человека в рабочее время, но пропущенный разбор
     # своего же провала хуже лишнего сообщения. Порог уровня остаётся: ❌ — это
     # то, где надо разбираться, ✅ и ⚠️ он видит в вечернем дайджесте.
-    if manager and manager["telegram_user_id"] and level == "❌":
+    if manager and manager["telegram_user_id"] and level == "❌" and not (sent and sent["immediate_sent_manager"]):
         try:
             text = render_short(short_report, level, call["duration_seconds"] or 0, call_time=call_time,
                                  client_number=call["client_number"])
@@ -95,7 +99,7 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
     # только провалы и важно было не завалить чат. Теперь задача обратная —
     # видеть все звонки за день.
     recipients = await report_chat_ids(pool, client["id"])
-    if recipients:
+    if recipients and not (sent and sent["immediate_sent_head"]):
         manager_name = (manager["full_name"] if manager else None) or f"доб. {call['extension']}"
         text = render_short(short_report, level, call["duration_seconds"] or 0, manager_name, call_time=call_time,
                              client_number=call["client_number"])
@@ -113,6 +117,22 @@ async def _deliver_immediate(pool: asyncpg.Pool, client: asyncpg.Record, call: a
             await pool.execute(
                 "UPDATE astra_analysis SET immediate_sent_head=true, updated_at=now() WHERE call_id=$1", call["id"]
             )
+
+
+async def _enqueue_variants(pool,client,call,transcript,level):
+    async with pool.acquire() as conn, conn.transaction():
+        from methodology.jobs import enqueue as enqueue_course
+        await enqueue_course(conn, call['client_id'], 'call', call['id'], transcript)
+        if level is not None:
+            from automatic.jobs import enqueue as enqueue_combined
+            from reports import fmt_phone
+            manager_name = await conn.fetchval("SELECT full_name FROM employees WHERE client_id=$1 AND extension=$2 AND role='manager'", call['client_id'], call['extension'])
+            await enqueue_combined(conn,call['client_id'],call['id'],transcript,{
+                'call_id':call['id'],'manager':manager_name or f"доб. {call['extension']}",
+                'extension':call['extension'], 'duration_seconds':call['duration_seconds'] or 0,
+                'call_started_at':call['call_started_at'].astimezone(ZoneInfo(client['timezone'])).isoformat() if call['call_started_at'] else None,
+                'timezone':client['timezone'],'phone':fmt_phone(call['client_number']) or 'неизвестен',
+            })
 
 
 @on_startup
@@ -136,51 +156,68 @@ async def analyze_call(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
         raise RuntimeError(f"calls.id={payload['call_id']} не найден")
     client = await pool.fetchrow("SELECT * FROM clients WHERE id=$1", call["client_id"])
 
-    if await _over_daily_limit(pool, client):
-        raise RetryLater(timedelta(minutes=BUDGET_RECHECK_MIN), "дневной лимит клиента исчерпан")
+    if not client['processing_enabled']:
+        raise RetryLater(timedelta(minutes=BUDGET_RECHECK_MIN), 'обработка клиента отключена')
 
-    await pool.execute("UPDATE calls SET status='processing', updated_at=now() WHERE id=$1", call["id"])
-    await pool.execute(
-        "INSERT INTO astra_analysis (call_id, status) VALUES ($1,'processing') "
-        "ON CONFLICT (call_id) DO UPDATE SET status='processing'",
-        call["id"],
-    )
+    prior = await pool.fetchrow('SELECT * FROM astra_analysis WHERE call_id=$1',call['id'])
+    cached = call['status']=='analyzed' and prior and prior['status']=='analyzed' and prior['short_report'] is not None
+    if cached:
+        transcript = call['transcript'] or ''
+        short_report = json.loads(prior['short_report'])
+        level, cost = prior['level'], float(prior['cost_units'] or 0)
+    else:
+        if await _over_daily_limit(pool, client):
+            raise RetryLater(timedelta(minutes=BUDGET_RECHECK_MIN), "дневной лимит клиента исчерпан")
 
+        await pool.execute("UPDATE calls SET status='processing', updated_at=now() WHERE id=$1", call["id"])
+        await pool.execute(
+            "INSERT INTO astra_analysis (call_id, status) VALUES ($1,'processing') "
+            "ON CONFLICT (call_id) DO UPDATE SET status='processing'",
+            call["id"],
+        )
+
+        try:
+            vpbx_api_key = decrypt(client["vpbx_api_key_enc"])
+            vpbx_api_salt = decrypt(client["vpbx_api_salt_enc"])
+
+            audio = await mango_client.fetch_recording(vpbx_api_key, vpbx_api_salt, call["recording_id"])
+            transcript, dg_duration = await transcribe_bytes(audio)
+            del audio
+
+            scores, score, level, rows, cost = await score_call(transcript)
+            short_report, short_cost = await short_report_call(transcript, scores, rows, level)
+            cost += short_cost
+            analysis = {**scores, "rows": rows}
+
+            await _add_spend(pool, client, cost)
+            log.info("Deepgram (справочно, не в бюджете Astra): $%.4f", dg_duration / 60 * DG_PRICE_PER_MIN_USD)
+        except Exception:
+            log.exception("ошибка обработки call id=%s (задача id=%s)", call["id"], task["id"])
+            await pool.execute("UPDATE calls SET status='new', updated_at=now() WHERE id=$1", call["id"])
+            await pool.execute("UPDATE astra_analysis SET status='new' WHERE call_id=$1", call["id"])
+            raise
+
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "UPDATE calls SET transcript=$2, status='analyzed', updated_at=now() WHERE id=$1",
+                call["id"], transcript,
+            )
+            await conn.execute(
+            """
+            UPDATE astra_analysis SET
+                status='analyzed', analysis=$2::jsonb, score=$3, level=$4, short_report=$5::jsonb,
+                cost_units=$6, updated_at=now()
+            WHERE call_id=$1
+            """,
+            call["id"], json.dumps(analysis, ensure_ascii=False), score, level,
+            json.dumps(short_report, ensure_ascii=False), cost,
+            )
+    enqueue_error = False
     try:
-        vpbx_api_key = decrypt(client["vpbx_api_key_enc"])
-        vpbx_api_salt = decrypt(client["vpbx_api_salt_enc"])
-
-        audio = await mango_client.fetch_recording(vpbx_api_key, vpbx_api_salt, call["recording_id"])
-        transcript, dg_duration = await transcribe_bytes(audio)
-        del audio
-
-        scores, score, level, rows, cost = await score_call(transcript)
-        short_report, short_cost = await short_report_call(transcript, scores, rows, level)
-        cost += short_cost
-        analysis = {**scores, "rows": rows}
-
-        await _add_spend(pool, client, cost)
-        log.info("Deepgram (справочно, не в бюджете Astra): $%.4f", dg_duration / 60 * DG_PRICE_PER_MIN_USD)
+        await _enqueue_variants(pool,client,call,transcript,level)
     except Exception:
-        log.exception("ошибка обработки call id=%s (задача id=%s)", call["id"], task["id"])
-        await pool.execute("UPDATE calls SET status='new', updated_at=now() WHERE id=$1", call["id"])
-        await pool.execute("UPDATE astra_analysis SET status='new' WHERE call_id=$1", call["id"])
-        raise
-
-    await pool.execute(
-        "UPDATE calls SET transcript=$2, status='analyzed', updated_at=now() WHERE id=$1",
-        call["id"], transcript,
-    )
-    await pool.execute(
-        """
-        UPDATE astra_analysis SET
-            status='analyzed', analysis=$2::jsonb, score=$3, level=$4, short_report=$5::jsonb,
-            cost_units=$6, updated_at=now()
-        WHERE call_id=$1
-        """,
-        call["id"], json.dumps(analysis, ensure_ascii=False), score, level,
-        json.dumps(short_report, ensure_ascii=False), cost,
-    )
+        log.exception('не удалось поставить дополнительные разборы, call id=%s',call['id'])
+        enqueue_error = True
     log.info("call id=%s разобран через очередь: уровень=%s стоимость=%.0f ед.", call["id"], level, cost)
 
     try:
@@ -188,9 +225,6 @@ async def analyze_call(pool: asyncpg.Pool, task: asyncpg.Record) -> dict:
     except Exception:
         log.exception("ошибка немедленной доставки, call id=%s", call["id"])
 
-    try:
-        from methodology.jobs import enqueue
-        await enqueue(pool, call['client_id'], 'call', call['id'], transcript)
-    except Exception:
-        log.exception('не удалось поставить параллельную оценку, call id=%s', call['id'])
-    return {"call_id": call["id"], "level": level, "cost_units": cost}
+    if enqueue_error:
+        raise RetryLater(timedelta(seconds=20),'повтор постановки дополнительных разборов без повторной оплаты исходного')
+    return {"call_id": call["id"], "level": level, "cost_units": cost, "cached": bool(cached)}

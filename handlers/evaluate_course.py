@@ -90,7 +90,11 @@ async def evaluate_course(pool, task):
             return {"evaluation_id": evaluation_id, "status": existing["status"], "needs_review": True}
         text = existing["response_text"]
     else:
-        if await over_daily_limit(pool, client):
+        # Automatic call alternatives share the existing overall client ceiling.
+        # The separate shadow-training cap remains in force for training.
+        from automatic.jobs import enabled as automatic_enabled, installed, over_budget
+        limit_hit = await over_budget(pool,client) if source=='call' and automatic_enabled() and await installed(pool) else await over_daily_limit(pool,client)
+        if limit_hit:
             raise RetryLater(timedelta(minutes=30), "дневной лимит клиента исчерпан")
         inserted = await pool.fetchval(
             f"INSERT INTO methodology_evaluations(client_id,{column},version,transcript_sha256,legacy_result,status) "

@@ -107,9 +107,15 @@ def detail_button(call_id: int, source: str = "pg", ready: bool = False) -> Inli
     source='astra' — разбор Astra; 'pg' оставлен для старых сообщений в чатах.
     Длина всегда далека от лимита Telegram в 64 байта на это поле."""
     text = "Разбор готов" if ready else "Подробный разбор"
-    return InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [InlineKeyboardButton(text=text, callback_data=f"detail:{source}:{call_id}")]
-    ])
+    ]
+    if source == 'astra':
+        buttons += [
+            [InlineKeyboardButton(text='Разбор по курсу', callback_data=f'av:c:{call_id}')],
+            [InlineKeyboardButton(text='Объединённый разбор', callback_data=f'av:b:{call_id}')],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def send_short_report(bot: Bot, chat_id: int, text: str, markup: InlineKeyboardMarkup) -> None:

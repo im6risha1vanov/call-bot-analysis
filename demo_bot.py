@@ -69,6 +69,8 @@ async def help_command(message):
     menu = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Сравнить методики'), KeyboardButton(text='Объединённый разбор')]], resize_keyboard=True, is_persistent=True) if actor and actor.role in {'head', 'owner'} else None
     await message.answer(
         'Звонки разбираются автоматически из Mango — присылать записи не нужно.\n\n'
+        'Под новым отчётом три кнопки: подробный разбор, разбор по курсу и объединённый разбор. '
+        'Два дополнительных варианта готовятся в фоне и открываются без повторной оплаты.\n\n'
         '<b>Команды</b>\n'
         '/check &lt;критерий&gt; [дней] — что модель увидела по критерию (руководителю)\n'
         '/assign_train &lt;добавочный&gt; [режим] — назначить тренировку в тренажёре (руководителю)\n'
@@ -573,6 +575,8 @@ from comparison.ui import install as install_comparison
 install_comparison(router, lambda: PG_POOL)
 from combined.ui import install as install_combined
 install_combined(router, lambda: PG_POOL)
+from automatic.ui import install as install_automatic
+install_automatic(router, lambda: PG_POOL)
 
 
 @router.message(F.text)
@@ -636,7 +640,7 @@ async def detail_callback(cq: CallbackQuery):
         'SELECT * FROM employees WHERE client_id=$1 AND telegram_user_id=$2',
         call['client_id'], cq.from_user.id,
     )
-    is_head_viewer = bool(employee) and employee['role'] == 'head'
+    is_head_viewer = bool(employee) and employee['role'] in {'head','owner'}
     is_own_manager = bool(employee) and employee['role'] == 'manager' and employee['extension'] == call['extension']
     if not (is_head_viewer or is_own_manager):
         await cq.answer('Доступ к разбору этого звонка закрыт.', show_alert=True); return
