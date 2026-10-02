@@ -103,7 +103,8 @@ async def deliver(pool,bot,actor,comparison_id,*,reopen=False):
             for call in calls:
                 row=await get(conn,actor,comparison_id,call['ordinal'])
                 if row['status'] in {'pending','processing','received'}:continue
-                if row['status']=='complete':
+                saved_preview=bool(row['result'] and decode(row['result']).get('data_origin')=='saved_analyses_preview')
+                if row['status']=='complete' or saved_preview:
                     chunks=render.cards(decode(row['result']),decode(row['metadata']))
                 else:
                     chunks=[f"Объединённый разбор звонка №{decode(row['metadata'])['call_id']} не получен. Статус: {row['status']}. Платный запрос автоматически не повторяется."]
@@ -111,16 +112,15 @@ async def deliver(pool,bot,actor,comparison_id,*,reopen=False):
                     if not reopen:
                         old=await conn.fetchval('SELECT status FROM combined_report_delivery WHERE comparison_id=$1 AND ordinal=$2 AND version=$3 AND recipient=$4 AND part=$5',comparison_id,call['ordinal'],evaluation.VERSION,actor.telegram_user_id,part)
                         if old in {'sent','sending','uncertain'}:continue
-                        await conn.execute("INSERT INTO combined_report_delivery(comparison_id,ordinal,version,recipient,part,status) VALUES($1,$2,$3,$4,$5,'sending') ON CONFLICT(comparison_id,ordinal,version,recipient,part) DO UPDATE SET status='sending',error=NULL,updated_at=now()",comparison_id,call['ordinal'],evaluation.VERSION,actor.telegram_user_id,part)
+                    await conn.execute("INSERT INTO combined_report_delivery(comparison_id,ordinal,version,recipient,part,status) VALUES($1,$2,$3,$4,$5,'sending') ON CONFLICT(comparison_id,ordinal,version,recipient,part) DO UPDATE SET status='sending',error=NULL,updated_at=now()",comparison_id,call['ordinal'],evaluation.VERSION,actor.telegram_user_id,part)
                     try:
-                        prefix=f'<b>Объединённый разбор · {call["ordinal"]}/{len(calls)}'+(f' · часть {part+1}/{len(chunks)}' if len(chunks)>1 else '')+'</b>\n\n'
-                        markup=render.keyboard(comparison_id,call['ordinal']) if row['status']=='complete' and part==len(chunks)-1 else None
+                        title='Пример оформления из сохранённых разборов' if saved_preview else 'Объединённый разбор'
+                        prefix=f'<b>{title} · {call["ordinal"]}/{len(calls)}'+(f' · часть {part+1}/{len(chunks)}' if len(chunks)>1 else '')+'</b>\n\n'
+                        markup=render.keyboard(comparison_id,call['ordinal']) if (row['status']=='complete' or saved_preview) and part==len(chunks)-1 else None
                         msg=await bot.send_message(actor.telegram_user_id,prefix+chunk,parse_mode='HTML',reply_markup=markup)
                     except Exception as exc:
-                        if not reopen:
-                            await conn.execute("UPDATE combined_report_delivery SET status='failed',error=$6 WHERE comparison_id=$1 AND ordinal=$2 AND version=$3 AND recipient=$4 AND part=$5",comparison_id,call['ordinal'],evaluation.VERSION,actor.telegram_user_id,part,type(exc).__name__)
+                        await conn.execute("UPDATE combined_report_delivery SET status='failed',error=$6 WHERE comparison_id=$1 AND ordinal=$2 AND version=$3 AND recipient=$4 AND part=$5",comparison_id,call['ordinal'],evaluation.VERSION,actor.telegram_user_id,part,type(exc).__name__)
                         raise RuntimeError('Combined report delivery failed') from None
-                    if not reopen:
-                        await conn.execute("UPDATE combined_report_delivery SET status='sent',message_id=$6,updated_at=now() WHERE comparison_id=$1 AND ordinal=$2 AND version=$3 AND recipient=$4 AND part=$5",comparison_id,call['ordinal'],evaluation.VERSION,actor.telegram_user_id,part,msg.message_id)
+                    await conn.execute("UPDATE combined_report_delivery SET status='sent',message_id=$6,updated_at=now() WHERE comparison_id=$1 AND ordinal=$2 AND version=$3 AND recipient=$4 AND part=$5",comparison_id,call['ordinal'],evaluation.VERSION,actor.telegram_user_id,part,msg.message_id)
         finally:
             await conn.execute('SELECT pg_advisory_unlock(hashtextextended($1,0))',key)

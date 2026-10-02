@@ -233,6 +233,22 @@ class CombinedPostgresTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(transport,'request',self.combined_fake):await jobs.run(self.pool,self.rid,1)
         self.assertEqual(len(self.requests),1)
 
+    async def test_offline_preview_keeps_failure_truthful_and_does_not_pay(self):
+        from combined.saved_preview import prepare
+        await jobs.request(self.pool,self.actor,self.rid)
+        await self.pool.execute("UPDATE combined_reports SET status='uncertain',error='provider HTTP 502'")
+        with patch.object(transport,'request',AsyncMock()) as fake:
+            self.assertTrue(await prepare(self.pool,self.actor,self.rid,1))
+            self.assertFalse(await prepare(self.pool,self.actor,self.rid,1))
+            await jobs.deliver(self.pool,self.telegram,self.actor,self.rid,reopen=True)
+        fake.assert_not_awaited()
+        row=await jobs.get(self.pool,self.actor,self.rid,1)
+        self.assertEqual(row['status'],'uncertain');self.assertIsNone(row['response_text'])
+        self.assertEqual(decode(row['result'])['data_origin'],'saved_analyses_preview')
+        text='\n'.join(c.args[1] for c in self.telegram.send_message.await_args_list)
+        self.assertIn('Пример оформления из сохранённых разборов',text)
+        self.assertIn('это не новая оценка',text)
+
     async def test_callback_current_user_ownership_and_always_acked(self):
         await self.complete();router=Router();ui.install(router,lambda:self.pool)
         telegram=Bot('123456:synthetic_test_token')
@@ -241,6 +257,11 @@ class CombinedPostgresTests(unittest.IsolatedAsyncioTestCase):
             callback=CallbackQuery(id='fake',from_user=User(id=user,is_bot=False,first_name='Person'),chat_instance='fake',data=data,message=message).as_(telegram)
             with patch.object(CallbackQuery,'answer',AsyncMock()) as ack,patch.object(Bot,'send_message',AsyncMock()) as send:
                 await router.propagate_event('callback_query',callback);ack.assert_awaited_once();return send
+        answer=await click(900,f'cb:d:{self.rid}:1')
+        self.assertIn('Критерии',answer.await_args.args[1])
+        from combined.saved_preview import prepare
+        await self.pool.execute("UPDATE combined_reports SET status='uncertain',response_text=NULL,result=NULL,error='provider HTTP 502' WHERE ordinal=1")
+        await prepare(self.pool,self.actor,self.rid,1)
         answer=await click(900,f'cb:d:{self.rid}:1')
         self.assertIn('Критерии',answer.await_args.args[1])
         for user,data,chat in ((123,f'cb:d:{self.rid}:1',None),(902,f'cb:d:{self.rid}:1',None),(900,'cb:bad:1:1',None),(900,f'cb:d:{self.rid}:1',901)):

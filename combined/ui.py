@@ -45,8 +45,10 @@ def install(router,pool_getter):
                 raise ValueError('Кнопка устарела или некорректна.')
             actor=await resolve_actor(pool,cq.from_user.id)
             row=await jobs.get(pool,actor,int(bits[2]),int(bits[3]))
-            if row['status']!='complete':raise ValueError('Подробности пока не готовы.')
-            for chunk in render.details(decode(row['result'])):
+            result=decode(row['result']) if row['result'] else None
+            if not result or (row['status']!='complete' and result.get('data_origin')!='saved_analyses_preview'):
+                raise ValueError('Подробности пока не готовы.')
+            for chunk in render.details(result):
                 await cq.bot.send_message(cq.from_user.id,chunk,parse_mode='HTML')
         except (Forbidden,ValueError) as exc:
             await cq.bot.send_message(cq.from_user.id,str(exc),parse_mode=None)
