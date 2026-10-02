@@ -234,6 +234,9 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeat_changes_circumstances_and_daily_limit_is_atomic(self):
         first=await training.start(self.pool,self.actor,'owner_minute',None,'dialog')
+        # Only answered, completed sessions are eligible for a repeat.
+        await self.pool.execute("UPDATE training_sessions SET transcript=$2::jsonb WHERE id=$1", first['id'],
+                                json.dumps([{'role':'client','text':'Слушаю.'},{'role':'manager','text':'Здравствуйте.'}]))
         await training.turn(self.pool,first,stop=True)
         second=await training.start(self.pool,self.actor,'repeat',None,'dialog')
         scenario=json.loads((await training.context(self.pool,second['id']))['scenario'])
@@ -243,6 +246,20 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         await training.turn(self.pool,third,stop=True)
         with self.assertRaises(training.TrainingLimit):
             await training.start(self.pool,self.actor,'support',None,'dialog')
+
+    async def test_repeat_requires_completed_session_and_ignores_later_abandoned(self):
+        abandoned=await training.start(self.pool,self.actor,'support',None,'dialog')
+        await training.turn(self.pool,abandoned,stop=True)
+        with self.assertRaises(training.TrainingLimit):
+            await training.pick(self.pool,self.actor,'repeat')
+        completed=await training.start(self.pool,self.actor,'expensive',None,'drill')
+        await training.turn(self.pool,completed,'С чем сравниваете стоимость?')
+        await training.turn(self.pool,completed,stop=True)
+        later=await training.start(self.pool,self.actor,'support',None,'dialog')
+        await training.turn(self.pool,later,stop=True)
+        changed=await training.pick(self.pool,self.actor,'repeat')
+        self.assertEqual(changed['id'],'expensive')
+        self.assertEqual(changed['repeat_number'],1)
 
     async def test_course_training_disabled_blocks_new_paid_turn(self):
         import training_simulator as old

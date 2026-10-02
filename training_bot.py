@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import logging
 import os
@@ -38,6 +37,7 @@ log = logging.getLogger('callbot-trainer')
 
 import tts  # noqa: E402  — читает переменные окружения при импорте, только после load_dotenv
 import training_simulator  # noqa: E402
+import training_menu as menu
 from methodology import training as course_training
 from methodology.runtime import training_enabled
 from deepgram_client import transcribe_bytes as dg_transcribe_bytes  # noqa: E402
@@ -47,6 +47,9 @@ BOT_TOKEN = os.environ['TRAIN_BOT_TOKEN']
 
 router = Router()
 PG_POOL: asyncpg.Pool | None = None
+# An action remains busy through the first reply, including legacy mode's paid
+# opening. Course sessions additionally retain their transaction-scoped DB lock.
+_ACTIONS_IN_PROGRESS: set[tuple[int, str]] = set()
 
 START_TEXT = (
     'Это тренажёр возражений. Я играю клиента, которому вы звоните вхолодную — '
@@ -60,17 +63,23 @@ START_TEXT = (
 
 def start_text():
     if training_enabled():
-        return ('Тренажёр продаж и сопровождения: разговор целиком или короткие упражнения. '
-                'Начать: /train. Выбрать продукт и ситуацию: /scenarios. '
-                'Отвечайте голосом или текстом. Завершить: /stop. '
-                'После тренировки получите разбор действий, цитаты и задачу для повтора. '
-                'Повторить ситуацию с изменёнными обстоятельствами: /repeat.')
-    return START_TEXT
+        greeting = 'Тренажёр продаж и сопровождения.'
+    else:
+        greeting = 'Тренажёр возражений: я играю клиента холодного звонка.'
+    return (greeting + '\n\n'
+            '🎯 Начать тренировку / 📋 Ситуации — выбрать ситуацию для полного разговора.\n'
+            '⚡ Короткая отработка — пять упражнений в выбранной ситуации.\n'
+            '🔁 Повторить — завершённая ситуация с изменёнными обстоятельствами.\n'
+            '⏹ Завершить — сохранить ответы и закончить тренировку.\n'
+            '❓ Помощь — показать эту подсказку.\n\n'
+            'Отвечайте голосовыми сообщениями или текстом. После завершения получите разбор. '
+            'Тренироваться нужно в личном чате с ботом.\n'
+            'Команды также работают: /train, /scenarios, /repeat, /stop, /help.')
 
 
-def _stop_keyboard() -> InlineKeyboardMarkup:
+def _stop_keyboard(session_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='Завершить тренировку', callback_data='train_stop')
+        InlineKeyboardButton(text='Завершить тренировку', callback_data=f'tm:s:{session_id}' if session_id else 'train_stop')
     ]])
 
 
@@ -89,7 +98,7 @@ async def _send_training_reply(message: Message, result: training_simulator.Turn
         return 0.0
     # Кнопка висит на реплике клиента, пока тренировка идёт: выйти можно в любой
     # момент, а не только досидев до конца.
-    markup = None if result.ended else _stop_keyboard()
+    markup = None if result.ended else _stop_keyboard(session_id)
     audio_cost = 0.0
     try:
         ogg_bytes, _cost = await tts.synthesize_ogg(result.reply_text)
@@ -118,7 +127,8 @@ async def _process_turn(message: Message, session, manager_text: str) -> None:
     await _send_training_reply(message, result, session['id'])
     if result.ended:
         level_line = f' Уровень: {result.level}.' if result.level else ''
-        await message.answer(f'Тренировка завершена.{level_line} Подробности доступны агенту РОПа.')
+        await message.answer(f'Тренировка завершена.{level_line} Подробности доступны агенту РОПа.',
+                             reply_markup=menu.main_keyboard())
 
 
 INTRO = {
@@ -132,9 +142,27 @@ INTRO = {
 
 async def _launch(message: Message, actor, topic: str | None, assigned_by: str | None,
                    mode: str = 'dialog', assignment_id: int | None = None) -> int | None:
+    key = (actor.client_id, training_simulator.actor_key(actor))
+    if key in _ACTIONS_IN_PROGRESS:
+        await message.answer('Предыдущее действие ещё выполняется. Дождитесь ответа бота.')
+        return None
+    _ACTIONS_IN_PROGRESS.add(key)
+    try:
+        return await _launch_session(message, actor, topic, assigned_by, mode, assignment_id)
+    finally:
+        _ACTIONS_IN_PROGRESS.discard(key)
+
+
+async def _busy(message: Message, session):
+    await message.answer('Тренировка уже идёт. Продолжайте отвечать голосом или текстом '
+                         'либо завершите её перед выбором новой ситуации.',
+                         reply_markup=menu.active_keyboard(session['id']))
+
+
+async def _launch_session(message: Message, actor, topic, assigned_by, mode, assignment_id):
     existing = await training_simulator.get_active_session(PG_POOL, actor)
     if existing is not None:
-        await message.answer('У вас уже есть незавершённая тренировка — закончите её, прежде чем начинать новую.')
+        await _busy(message, existing)
         return
     client = await PG_POOL.fetchrow('SELECT timezone FROM clients WHERE id=$1', actor.client_id)
     tz_name = client['timezone'] if client else 'Europe/Moscow'
@@ -149,14 +177,16 @@ async def _launch(message: Message, actor, topic: str | None, assigned_by: str |
         else:
             session = await training_simulator.start_session(PG_POOL, actor, topic, assigned_by, assignment_id)
     except course_training.TrainingLimit as exc:
-        await message.answer(str(exc))
+        await message.answer(str(exc), reply_markup=menu.main_keyboard())
         return None
     opening = json.loads(session['transcript'])[0]['text']
     context = await course_training.context(PG_POOL, session['id'])
     if assignment_id is not None and not context:
         await PG_POOL.execute('UPDATE pending_train_assignments SET consumed=true WHERE id=$1 AND client_id=$2 AND extension=$3',
                               assignment_id, actor.client_id, actor.extension)
-    await message.answer(course_training.intro(json.loads(context['scenario']), mode) if context else INTRO[mode])
+    introduction = course_training.intro(json.loads(context['scenario']), mode) if context else INTRO[mode]
+    await message.answer(f'Режим: {menu.MODE_NAMES[mode]}.\n{introduction}\n'
+                         'Завершить можно кнопкой «⏹ Завершить».', reply_markup=menu.main_keyboard())
     await _send_training_reply(message, training_simulator.TurnResult(opening, False), session['id'])
     return session['id']
 
@@ -165,6 +195,9 @@ async def _require_employee(message: Message):
     """Руководителя тоже пускаем: он должен иметь возможность пройти тренажёр
     сам и решить, годится ли инструмент для отдела. Его сессии помечаются
     пробными и в статистику отдела не попадают."""
+    if message.chat.type != 'private' or message.chat.id != message.from_user.id:
+        await message.answer('Тренировки доступны в личном чате с ботом. Откройте его и нажмите /start.')
+        return None
     if PG_POOL is None:
         return None
     actor = await resolve_actor(PG_POOL, message.from_user.id)
@@ -181,7 +214,7 @@ async def start_command(message: Message, command: CommandObject):
     даст ему написать первым), и стартует назначенную сессию."""
     payload = (command.args or '').strip()
     if not payload.startswith('train_'):
-        await message.answer(start_text())
+        await help_command(message)
         return
 
     actor = await _require_employee(message)
@@ -190,14 +223,15 @@ async def start_command(message: Message, command: CommandObject):
     try:
         assignment_id = int(payload.removeprefix('train_'))
     except ValueError:
-        await message.answer(start_text())
+        await help_command(message)
         return
 
     assignment = await PG_POOL.fetchrow(
         'SELECT * FROM pending_train_assignments WHERE id=$1 AND consumed=false', assignment_id
     )
     if not assignment or assignment['extension'] != actor.extension or assignment['client_id'] != actor.client_id:
-        await message.answer('Это назначение не для вас или уже использовано. Начать обычную тренировку: /train')
+        await message.answer('Это назначение не для вас или уже использовано. Выберите «🎯 Начать тренировку».',
+                             reply_markup=menu.main_keyboard())
         return
     await _launch(message, actor, topic=assignment['topic'],
                   assigned_by=str(assignment['assigned_by_telegram_user_id']),
@@ -206,30 +240,7 @@ async def start_command(message: Message, command: CommandObject):
 
 @router.callback_query(F.data == 'train_stop')
 async def train_stop_callback(cq: CallbackQuery):
-    if PG_POOL is None:
-        await cq.answer()
-        return
-    actor = await resolve_actor(PG_POOL, cq.from_user.id)
-    if actor is None:
-        await cq.answer('Вы не привязаны к системе.', show_alert=True)
-        return
-    session = await training_simulator.get_active_session(PG_POOL, actor)
-    if session is None:
-        await cq.answer('Активной тренировки нет.', show_alert=True)
-        return
-    await cq.answer()
-    try:
-        await cq.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    try:
-        text, level = await training_simulator.end_session_early(PG_POOL, session)
-    except Exception:
-        log.exception('ошибка досрочного завершения, session id=%s', session['id'])
-        await cq.message.answer('Не удалось завершить тренировку, попробуйте ещё раз.')
-        return
-    level_line = f' Уровень: {level}.' if level else ''
-    await cq.message.answer(f'{text}{level_line}')
+    await _handle_callback(cq, ('s', None, None))
 
 
 @router.message(Command('stop'))
@@ -238,18 +249,43 @@ async def stop_command(message: Message):
     actor = await _require_employee(message)
     if actor is None:
         return
-    session = await training_simulator.get_active_session(PG_POOL, actor)
-    if session is None:
-        await message.answer('Активной тренировки нет. Начать: /train')
+    await _stop(message, actor)
+
+
+async def _stop(message: Message, actor, session_id: int | None = None, *, legacy_button=False):
+    key = (actor.client_id, training_simulator.actor_key(actor))
+    if key in _ACTIONS_IN_PROGRESS:
+        await message.answer('Предыдущее действие ещё выполняется. Дождитесь ответа бота.')
         return
-    text, level = await training_simulator.end_session_early(PG_POOL, session)
-    level_line = f' Уровень: {level}.' if level else ''
-    await message.answer(f'{text}{level_line}')
+    _ACTIONS_IN_PROGRESS.add(key)
+    try:
+        session = await training_simulator.get_active_session(PG_POOL, actor)
+        if session is None:
+            await message.answer('Активной тренировки нет. Выберите «🎯 Начать тренировку».',
+                                 reply_markup=menu.main_keyboard())
+            return
+        older_button = (legacy_button and session.get('started_at') is not None
+                        and int(message.date.timestamp()) < int(session['started_at'].timestamp()))
+        if older_button or (session_id is not None and session['id'] != session_id):
+            await message.answer('Эта кнопка относится к другой тренировке. Текущая тренировка продолжается.',
+                                 reply_markup=menu.active_keyboard(session['id']))
+            return
+        text, level = await training_simulator.end_session_early(PG_POOL, session)
+        level_line = f' Уровень: {level}.' if level else ''
+        await message.answer(f'{text}{level_line}', reply_markup=menu.main_keyboard())
+    except Exception:
+        log.exception('ошибка досрочного завершения')
+        await message.answer('Не удалось завершить тренировку, попробуйте ещё раз.')
+    finally:
+        _ACTIONS_IN_PROGRESS.discard(key)
 
 
 @router.message(Command('help'))
 async def help_command(message: Message):
-    await message.answer(start_text())
+    if message.chat.type != 'private':
+        await message.answer('Откройте личный чат с ботом и нажмите /start — там доступно меню тренировок.')
+        return
+    await message.answer(start_text(), reply_markup=menu.main_keyboard())
 
 
 def _mode_keyboard() -> InlineKeyboardMarkup:
@@ -281,14 +317,31 @@ async def train_command(message: Message):
 
 @router.message(Command('scenarios'))
 async def scenarios_command(message: Message):
-    if not await _require_employee(message):
+    await _choose(message, 'dialog')
+
+
+async def _choose(message: Message, mode: str):
+    actor = await _require_employee(message)
+    if actor is None:
         return
-    if not training_enabled():
-        await message.answer('Сценарии по курсу сейчас выключены. Начать обычную тренировку: /train')
+    await _catalog(message, actor, mode)
+
+
+async def _catalog(message: Message, actor, mode: str, page=0, *, edit=False):
+    session = await training_simulator.get_active_session(PG_POOL, actor)
+    if session:
+        await _busy(message, session)
         return
-    from methodology.scenarios import SCENARIOS
-    await message.answer('Выберите ситуацию:\n' + '\n'.join(f"/train {s['id']} — {s['title']}" for s in SCENARIOS)
-                         + '\nКороткая отработка: /train возражения <название ситуации>')
+    text, markup = menu.catalog(mode, page, enabled=training_enabled())
+    if edit:
+        from aiogram.exceptions import TelegramBadRequest
+        try:
+            await message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest as exc:
+            if 'message is not modified' not in str(exc).lower():
+                raise
+    else:
+        await message.answer(text, reply_markup=markup)
 
 
 @router.message(Command('repeat'))
@@ -304,23 +357,75 @@ async def repeat_command(message: Message):
 
 @router.callback_query(F.data.startswith('train_mode:'))
 async def train_mode_callback(cq: CallbackQuery):
-    if PG_POOL is None:
-        await cq.answer()
-        return
-    actor = await resolve_actor(PG_POOL, cq.from_user.id)
-    if actor is None:
-        await cq.answer('Вы не привязаны к системе.', show_alert=True)
-        return
     mode = cq.data.rsplit(':', 1)[1]
-    if mode not in ('dialog', 'drill'):
-        await cq.answer('Неизвестный режим.', show_alert=True)
+    await _handle_callback(cq, ('g', mode, None) if mode in menu.MODE_NAMES else None)
+
+
+@router.callback_query(F.data.startswith('tm:'))
+async def menu_callback(cq: CallbackQuery):
+    await _handle_callback(cq, menu.parse(cq.data))
+
+
+async def _handle_callback(cq: CallbackQuery, action):
+    # Always acknowledge, including malformed/stale callbacks and provider errors.
+    if not isinstance(cq.message, Message):
+        await cq.answer('Сообщение недоступно. Откройте личный чат с ботом и нажмите /start.', show_alert=True)
+        return
+    if cq.message.chat.type != 'private' or cq.message.chat.id != cq.from_user.id:
+        await cq.answer('Эти кнопки доступны только в вашем личном чате с ботом.', show_alert=True)
         return
     await cq.answer()
     try:
-        await cq.message.edit_reply_markup(reply_markup=None)
+        if PG_POOL is None:
+            await cq.message.answer('Бот запускается. Попробуйте чуть позже.')
+            return
+        actor = await resolve_actor(PG_POOL, cq.from_user.id)
+        if actor is None:
+            await cq.message.answer('Вы не привязаны к системе. Попросите руководителя подключить вас к основному боту.')
+            return
+        if action is None:
+            await cq.message.answer('Эта кнопка устарела или неизвестна. Откройте «📋 Ситуации».',
+                                    reply_markup=menu.main_keyboard())
+            return
+        kind, mode, value = action
+        if kind == 'h':
+            await cq.message.edit_text('Выберите действие в меню под полем ввода.', reply_markup=None)
+            await help_command(cq.message)
+        elif kind == 'p':
+            await _catalog(cq.message, actor, mode, value, edit=True)
+        elif kind == 's':
+            await _stop(cq.message, actor, value, legacy_button=value is None)
+        elif kind == 'c':
+            session = await training_simulator.get_active_session(PG_POOL, actor)
+            if session:
+                await cq.message.answer('Продолжайте отвечать на последнюю реплику клиента голосом или текстом.',
+                                        reply_markup=menu.main_keyboard())
+            else:
+                await cq.message.answer('Активной тренировки нет. Выберите «🎯 Начать тренировку».',
+                                        reply_markup=menu.main_keyboard())
+        elif kind in {'g', 'r'}:
+            if kind == 'r' and not training_enabled():
+                await cq.message.answer('Сценарии по курсу сейчас выключены. Откройте «📋 Ситуации».',
+                                        reply_markup=menu.main_keyboard())
+                return
+            await _launch(cq.message, actor, topic=value, assigned_by=None, mode=mode)
     except Exception:
-        pass
-    await _launch(cq.message, actor, topic=None, assigned_by=None, mode=mode)
+        log.exception('ошибка кнопки тренажёра')
+        await cq.message.answer('Не удалось выполнить действие. Попробуйте ещё раз или откройте меню через /help.')
+
+
+@router.message(F.text.in_(menu.ACTIONS))
+async def menu_action(message: Message):
+    if message.text in {menu.START, menu.SCENARIOS}:
+        await _choose(message, 'dialog')
+    elif message.text == menu.DRILL:
+        await _choose(message, 'drill')
+    elif message.text == menu.REPEAT:
+        await repeat_command(message)
+    elif message.text == menu.STOP:
+        await stop_command(message)
+    elif message.text == menu.HELP:
+        await help_command(message)
 
 
 @router.message(F.voice)
@@ -333,7 +438,7 @@ async def voice_turn(message: Message):
         return
     session = await training_simulator.get_active_session(PG_POOL, actor)
     if session is None:
-        await message.answer('Нет активной тренировки. Начать: /train')
+        await message.answer('Нет активной тренировки. Выберите «🎯 Начать тренировку».', reply_markup=menu.main_keyboard())
         return
     try:
         file = await message.bot.get_file(message.voice.file_id)
@@ -355,7 +460,7 @@ async def text_turn(message: Message):
         return
     session = await training_simulator.get_active_session(PG_POOL, actor)
     if session is None:
-        await message.answer('Нет активной тренировки. Начать: /train')
+        await message.answer('Нет активной тренировки. Выберите «🎯 Начать тренировку».', reply_markup=menu.main_keyboard())
         return
     await _process_turn(message, session, message.text or '')
 

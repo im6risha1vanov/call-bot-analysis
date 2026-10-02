@@ -42,7 +42,8 @@ async def pick(pool, actor, topic):
     if topic == 'repeat':
         previous = await pool.fetchrow("""SELECT mc.scenario FROM methodology_training_context mc
             JOIN training_sessions t ON t.id=mc.session_id WHERE t.client_id=$1 AND t.extension=$2
-            AND mc.telegram_user_id=$3 AND mc.version=$4 ORDER BY t.id DESC LIMIT 1""",
+            AND mc.telegram_user_id=$3 AND mc.version=$4 AND t.status='completed'
+            ORDER BY t.id DESC LIMIT 1""",
             actor.client_id, actor.extension or '', actor.telegram_user_id, VERSION)
         if previous:
             item = json.loads(previous['scenario'])
@@ -50,7 +51,7 @@ async def pick(pool, actor, topic):
             changed = variants(item)[repeat % 5]
             changed['repeat_number'] = repeat
             return changed
-        raise TrainingLimit('Предыдущей тренировки по курсу нет. Начать: /train')
+        raise TrainingLimit('Завершённой тренировки по курсу пока нет. Выберите «🎯 Начать тренировку».')
     explicit = find(topic)
     if explicit:
         return explicit
