@@ -167,7 +167,9 @@ async def turn(pool, stale_session, manager_text=None, *, stop=False):
                                    session['id'], json.dumps(turns, ensure_ascii=False), json.dumps(drill, ensure_ascii=False), len(turns))
                 if ended:
                     await _finish(conn, session, turns)
-                return old.TurnResult(reply, ended, note='Ответ сохранён. Разбор учитывает этап и контекст упражнения.')
+                return old.TurnResult(reply, ended,
+                                      note='Ответ сохранён. Разбор учитывает этап и контекст упражнения.',
+                                      speech_text='' if ended else drill['exercises'][len(done)]['objection'])
             # Durable intent before the network call: interruption cannot lead to automatic recharging.
             await conn.execute("UPDATE training_sessions SET transcript=$2::jsonb,turns_count=$3,updated_at=now() WHERE id=$1", session['id'], json.dumps(turns, ensure_ascii=False), len(turns))
             await conn.execute("UPDATE methodology_training_context SET turn_state='pending' WHERE session_id=$1", session['id'])

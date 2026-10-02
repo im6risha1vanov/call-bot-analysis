@@ -157,6 +157,73 @@ class InteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ack.await_count, 2 * len(scenarios.SCENARIOS))
         self.assertIn('Режим: Короткая отработка', self.answer.await_args_list[-2].args[0])
 
+    async def test_first_drill_voice_contains_only_objection_for_every_scenario(self):
+        self.tts.side_effect = None
+        self.tts.return_value = (b'fake-ogg', .01)
+        for item in scenarios.SCENARIOS:
+            pinned = {**item, 'exercises': scenarios.variants(item)}
+            opening = training.exercise_opening(pinned['exercises'][0])
+            self.context.return_value = {'scenario': json.dumps(pinned)}
+            self.drill.return_value = {**self.session, 'mode': 'drill',
+                                      'transcript': json.dumps([{'role': 'client', 'text': opening}])}
+            await bot.menu_callback(self.callback(f"tm:r:o:{item['id']}"))
+            self.tts.assert_awaited_with(item['objection'])
+            self.assertEqual(self.answer.await_args.args[0], opening)
+            self.assertIn('Упражнение 1:', opening)
+        self.assertEqual(self.send_voice.await_count, len(scenarios.SCENARIOS))
+        self.assertEqual(self.audio_cost.await_count, len(scenarios.SCENARIOS))
+
+    async def test_next_drill_voice_skips_exercise_context_and_coaching(self):
+        item = scenarios.variants(scenarios.SCENARIOS[3])[1]
+        opening = training.exercise_opening(item)
+        self.tts.side_effect = None
+        self.tts.return_value = (b'fake-ogg', .01)
+        self.drill_turn.return_value = bot.training_simulator.TurnResult(
+            opening, False, note='Ответ сохранён.', speech_text=item['objection'])
+        await bot._process_turn(self.message('Мой ответ'), {**self.session, 'mode': 'drill'}, 'Мой ответ')
+        self.tts.assert_awaited_once_with(item['objection'])
+        self.assertEqual([c.args[0] for c in self.answer.await_args_list], ['Ответ сохранён.', opening])
+
+    async def test_drill_context_fallback_is_not_duplicated(self):
+        item = scenarios.variants(scenarios.SCENARIOS[3])[0]
+        opening = training.exercise_opening(item)
+        result = bot.training_simulator.TurnResult(opening, False, speech_text=item['objection'])
+        for error in (bot.tts.TTSNotConfigured(), bot.tts.TTSError('synthetic failure')):
+            self.answer.reset_mock()
+            self.audio_cost.reset_mock()
+            self.tts.side_effect = error
+            if isinstance(error, bot.tts.TTSError):
+                with self.assertLogs('callbot-trainer', level='ERROR'):
+                    cost = await bot._send_training_reply(self.message(), result, 7, mode='drill')
+            else:
+                cost = await bot._send_training_reply(self.message(), result, 7, mode='drill')
+            self.assertEqual(cost, 0)
+            self.answer.assert_awaited_once_with(opening, reply_markup=bot._stop_keyboard(7))
+            self.audio_cost.assert_not_awaited()
+
+    async def test_drill_summary_is_text_only(self):
+        result = bot.training_simulator.TurnResult('Отработка закончена: зачтено 3 из 5.', True)
+        await bot._send_training_reply(self.message(), result, 7, mode='drill')
+        self.tts.assert_not_awaited()
+        self.answer.assert_awaited_once_with(result.reply_text, reply_markup=None)
+
+    async def test_full_dialogue_voice_preserves_entire_client_reply(self):
+        self.tts.side_effect = None
+        self.tts.return_value = (b'fake-ogg', .01)
+        result = bot.training_simulator.TurnResult('Расскажите, чем ваше предложение нам поможет.', False)
+        await bot._send_training_reply(self.message(), result, 7, mode='dialog')
+        self.tts.assert_awaited_once_with(result.reply_text)
+        self.answer.assert_not_awaited()
+
+    async def test_legacy_drill_still_speaks_plain_objection(self):
+        self.context.return_value = None
+        self.tts.side_effect = None
+        self.tts.return_value = (b'fake-ogg', .01)
+        self.drill.return_value = {**self.session, 'mode': 'drill',
+                                  'transcript': json.dumps([{'role': 'client', 'text': 'Это дорого для нас.'}])}
+        await bot._launch(self.message(), self.actor, None, None, mode='drill')
+        self.tts.assert_awaited_once_with('Это дорого для нас.')
+
     async def test_pagination_edits_same_message_preserves_mode_and_home(self):
         for data in ['tm:p:o:1', 'tm:p:o:2', 'tm:p:o:1', 'tm:p:o:0']:
             await bot.menu_callback(self.callback(data))

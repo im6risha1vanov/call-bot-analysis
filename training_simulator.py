@@ -268,14 +268,18 @@ async def start_session(pool: asyncpg.Pool, actor: Actor, topic: str | None,
 
 
 class TurnResult:
-    def __init__(self, reply_text: str, ended: bool, level: str | None = None, note: str | None = None):
-        self.reply_text = reply_text  # реплика клиента — её озвучиваем
+    def __init__(self, reply_text: str, ended: bool, level: str | None = None, note: str | None = None,
+                 speech_text: str | None = None):
+        self.reply_text = reply_text  # видимый ответ; в упражнениях включает текстовый контекст
         self.ended = ended
         self.level = level
         # Служебный комментарий (разбор предыдущего ответа в режиме отработки).
         # Отправляется текстом, а не голосом: иначе «клиент» посреди звонка
         # начал бы вслух оценивать работу менеджера.
         self.note = note
+        # Course drills retain the exercise context in reply_text/history, but
+        # only the client's actual objection should be spoken. Empty = text only.
+        self.speech_text = speech_text
 
 
 async def handle_manager_turn(pool: asyncpg.Pool, session: asyncpg.Record, manager_text: str) -> TurnResult:

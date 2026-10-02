@@ -148,8 +148,13 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_drill_context_persisted_and_final_task_atomic(self):
         session=await training.start(self.pool,self.actor,'expensive',None,'drill')
-        for _ in range(5):
+        for n in range(5):
             result=await training.turn(self.pool,session,'С чем сравниваете стоимость?')
+            if n < 4:
+                self.assertEqual(result.speech_text,'Этот пакет для нас дорогой.')
+                self.assertIn('Упражнение',result.reply_text)
+            else:
+                self.assertEqual(result.speech_text,'')
         self.assertTrue(result.ended)
         row=await self.pool.fetchrow('SELECT * FROM training_sessions WHERE id=$1',session['id'])
         self.assertEqual(row['status'],'completed')

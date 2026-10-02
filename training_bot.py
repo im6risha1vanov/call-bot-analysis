@@ -83,9 +83,10 @@ def _stop_keyboard(session_id: int | None = None) -> InlineKeyboardMarkup:
     ]])
 
 
-async def _send_training_reply(message: Message, result: training_simulator.TurnResult, session_id: int | None = None) -> float:
-    """Голос — основной путь; текст — откат, если TTS ещё не настроен
-    (см. tts.py) или синтез не удался.
+async def _send_training_reply(message: Message, result: training_simulator.TurnResult, session_id: int | None = None,
+                               *, mode: str = 'dialog') -> float:
+    """Голос содержит реплику клиента; контекст упражнения остаётся текстом.
+    При недоступном TTS ответ доступен в тексте без дублирования.
 
     result.note (разбор предыдущего ответа в режиме отработки) уходит текстом
     отдельно: это голос тренера, а не клиента, озвучивать его нельзя."""
@@ -99,19 +100,29 @@ async def _send_training_reply(message: Message, result: training_simulator.Turn
     # Кнопка висит на реплике клиента, пока тренировка идёт: выйти можно в любой
     # момент, а не только досидев до конца.
     markup = None if result.ended else _stop_keyboard(session_id)
+    speech_text = result.reply_text if result.speech_text is None else result.speech_text
+    if mode == 'drill' and result.ended:
+        speech_text = ''  # Results and coaching belong in text, not the client's voice.
+    displayed = speech_text != result.reply_text
+    if displayed:
+        await message.answer(result.reply_text, reply_markup=markup)
+    if not speech_text:
+        return 0.0
     audio_cost = 0.0
     try:
-        ogg_bytes, _cost = await tts.synthesize_ogg(result.reply_text)
+        ogg_bytes, _cost = await tts.synthesize_ogg(speech_text)
         audio_cost = _cost
         if session_id is not None:
             await course_training.record_audio_cost(PG_POOL, session_id, audio_cost)
         await message.bot.send_voice(message.chat.id, voice=BufferedInputFile(ogg_bytes, filename='client.ogg'),
                                       reply_markup=markup)
     except tts.TTSNotConfigured:
-        await message.answer(result.reply_text, reply_markup=markup)
+        if not displayed:
+            await message.answer(result.reply_text, reply_markup=markup)
     except Exception:
         log.exception('ошибка синтеза речи тренажёра')
-        await message.answer(result.reply_text, reply_markup=markup)
+        if not displayed:
+            await message.answer(result.reply_text, reply_markup=markup)
     return audio_cost
 
 
@@ -124,7 +135,7 @@ async def _process_turn(message: Message, session, manager_text: str) -> None:
         log.exception('ошибка хода тренажёра, session id=%s', session['id'])
         await message.answer('Не удалось обработать ответ, попробуйте ещё раз.')
         return
-    await _send_training_reply(message, result, session['id'])
+    await _send_training_reply(message, result, session['id'], mode=session['mode'])
     if result.ended:
         level_line = f' Уровень: {result.level}.' if result.level else ''
         await message.answer(f'Тренировка завершена.{level_line} Подробности доступны агенту РОПа.',
@@ -180,7 +191,11 @@ async def _launch_session(message: Message, actor, topic, assigned_by, mode, ass
     introduction = course_training.intro(json.loads(context['scenario']), mode) if context else INTRO[mode]
     await message.answer(f'Режим: {menu.MODE_NAMES[mode]}.\n{introduction}\n'
                          'Завершить можно кнопкой «⏹ Завершить».', reply_markup=menu.main_keyboard())
-    await _send_training_reply(message, training_simulator.TurnResult(opening, False), session['id'])
+    first_reply = training_simulator.TurnResult(opening, False)
+    if context and mode == 'drill':
+        exercises = json.loads(context['scenario']).get('exercises', [])
+        first_reply.speech_text = exercises[0]['objection'] if exercises else ''
+    await _send_training_reply(message, first_reply, session['id'], mode=mode)
     return session['id']
 
 
