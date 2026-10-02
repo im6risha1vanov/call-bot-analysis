@@ -226,7 +226,10 @@ def evaluate(raw: dict, transcript: str, *, config=None, commercial_catalog=None
         if training_exercises is not None:
             source = exercise_contexts.get(exercise['exercise'])
             if not source:
-                raise InvalidEvaluation('Exercise must match an answered exercise')
+                # A stopped drill may contain only some answers. The provider
+                # can return all five; never grade unanswered exercises or
+                # discard the valid feedback for answers already received.
+                continue
             scenario = source['scenario']
             if scenario['role'] not in ROLES or scenario['stage'] not in STAGES or scenario['product'] not in PRODUCTS:
                 raise InvalidEvaluation('Invalid pinned exercise profile')

@@ -346,6 +346,34 @@ class PostgreSQLTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved['exercise_results'][0]['status'],'passed')
         self.assertIsNone(saved['quality']['score'])
 
+    async def test_partial_drill_saved_receipt_recovers_without_another_paid_request(self):
+        import handlers.evaluate_course as handler
+        session=await training.start(self.pool,self.actor,'expensive',None,'drill')
+        answer='С чем сравниваете стоимость?'
+        await training.turn(self.pool,session,answer)
+        await training.turn(self.pool,session,stop=True)
+        task=dict(await self.pool.fetchrow('SELECT * FROM tasks LIMIT 1'))
+        raw=response()
+        raw['exercise_results']=[{'exercise':n,'criterion':'economics','status':'passed',
+                                 'evidence':answer,'reason':'Уточнение сравнения','say_instead':''} for n in range(1,6)]
+        payload=json.loads(task['input'])
+        eid=await self.pool.fetchval("""INSERT INTO methodology_evaluations(client_id,training_session_id,version,
+           transcript_sha256,status,error) VALUES(1,$1,$2,$3,'failed','InvalidEvaluation') RETURNING id""",
+           session['id'],VERSION,payload['sha256'])
+        client=await self.pool.fetchrow('SELECT * FROM clients WHERE id=1')
+        await jobs.store_receipt(self.pool,eid,client,json.dumps(raw),3)
+        provider=AsyncMock(side_effect=AssertionError('Must reuse the saved provider response'))
+        bot=SimpleNamespace(send_message=AsyncMock(),session=SimpleNamespace(close=AsyncMock()))
+        with patch.object(transport,'request',provider),patch.object(handler,'Bot',return_value=bot):
+            await self.handler(self.pool,task)
+        row=await self.pool.fetchrow('SELECT * FROM methodology_evaluations WHERE id=$1',eid)
+        self.assertEqual(row['status'],'complete')
+        self.assertTrue(row['feedback_sent'])
+        self.assertEqual([e['exercise'] for e in json.loads(row['result'])['exercise_results']],[1])
+        provider.assert_not_awaited()
+        self.assertEqual(float(await self.pool.fetchval('SELECT sum(spent_units) FROM methodology_daily_spend')),3)
+        bot.send_message.assert_awaited_once()
+
     async def test_original_queue_progresses_during_slow_course_request(self):
         import queue_runner as queue
         await jobs.enqueue(self.pool,1,'call',self.call_id,TRANSCRIPT)

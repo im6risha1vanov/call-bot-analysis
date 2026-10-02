@@ -58,6 +58,18 @@ class EvaluationTests(unittest.TestCase):
         with self.assertRaises(evaluation.InvalidEvaluation):
             evaluation.evaluate(raw,'Здравствуйте.',training_exercises=[source])
 
+    def test_partial_drill_keeps_answered_feedback_and_ignores_remaining_exercises(self):
+        item=find('expensive');item.update(exercise=1,mixed_drill=True)
+        answer='С чем сравниваете стоимость?'
+        source={'scenario':item,'objection':item['objection'],'answer':answer}
+        raw=response()
+        raw['exercise_results']=[{'exercise':n,'criterion':'economics','status':'passed',
+                                 'evidence':answer,'reason':'Уточнение сравнения','say_instead':''} for n in range(1,6)]
+        result=evaluation.evaluate(raw,answer,training_exercises=[source])
+        self.assertEqual([e['exercise'] for e in result['exercise_results']],[1])
+        self.assertEqual(result['exercise_results'][0]['status'],'passed')
+        self.assertTrue(result['mixed_drill'])
+
     def test_all_six_profiles_and_three_roles(self):
         for role in profiles.ROLES - {'unknown'}:
             for stage in profiles.STAGES - {'unknown'}:
