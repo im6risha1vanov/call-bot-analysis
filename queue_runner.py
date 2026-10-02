@@ -167,6 +167,7 @@ async def main() -> None:
     # конкретные типы задач ничего не знает.
     import handlers.analyze_call  # noqa: F401
     import handlers.evaluate_course  # noqa: F401
+    import handlers.compare_analysis  # noqa: F401
     import handlers.oversight_report  # noqa: F401
     import handlers.rop_digest  # noqa: F401
 
@@ -182,8 +183,18 @@ async def main() -> None:
                 handled = False
             if not handled:
                 await asyncio.sleep(POLL_INTERVAL_SEC)
+    async def comparison_loop():
+        while True:
+            try:
+                handled = await run_once(pool, ['compare_analysis'])
+            except Exception:
+                log.exception('ошибка цикла сравнения методик')
+                handled = False
+            if not handled:
+                await asyncio.sleep(POLL_INTERVAL_SEC)
     course_task = asyncio.create_task(course_loop())
-    original_types = [kind for kind in _REGISTRY if kind != 'evaluate_course']
+    comparison_task = asyncio.create_task(comparison_loop())
+    original_types = [kind for kind in _REGISTRY if kind not in {'evaluate_course', 'compare_analysis'}]
     try:
         while True:
             handled = await run_once(pool, original_types)
@@ -191,7 +202,8 @@ async def main() -> None:
                 await asyncio.sleep(POLL_INTERVAL_SEC)
     finally:
         course_task.cancel()
-        await asyncio.gather(course_task, return_exceptions=True)
+        comparison_task.cancel()
+        await asyncio.gather(course_task, comparison_task, return_exceptions=True)
         await pool.close()
 
 

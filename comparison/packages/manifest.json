@@ -1,0 +1,30 @@
+{
+  "legacy_52e4d575": {
+    "source_commit": "52e4d575c03788d09194346362b1e06ef4476feb",
+    "files": {
+      "legacy/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "legacy/analysis.py": "eee685f1bc0a31f8301ffef332a703d5d0569f7eff97b5073dc8f1b545d28951",
+      "legacy/prompt_review.md": "fad4cda6e2d37f836fdc74e1ba1f6f81dc88ce24da15dd31eb5639b741f212d1",
+      "legacy/prompt_score.md": "3a8e17491b0860e8ab6dd32001af4feeee9d91ca5a649bb1eca65afd88f160b4",
+      "legacy/prompt_short.md": "f98bb2df92885817a07d15ac7c9127a8fb2377a00859b11d4b87a1afa061f139"
+    },
+    "sha256": "484433874b7d7a83f8c87e8daebd8fecad72ce26c01d50a85e7ffb446f594380"
+  },
+  "course_2025_v1": {
+    "source_commit": "3fd96b542fa727dc07ad71b112022a0d6f2d7e87",
+    "files": {
+      "course/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "course/methodology/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "course/methodology/catalog.json": "250cb383731de2aff3d2122cf111bffaee2c5c679a75b512ae3b4340af8ebfba",
+      "course/methodology/config.json": "bf2a737b399c92b85e52860dac5744760e8d77aea0e7a1b62f8945623da28dbc",
+      "course/methodology/economics.py": "134886f217d0d2433b83ce59a16e0e63dadba6a3861d46c46c5785d40a32ef8e",
+      "course/methodology/evaluation.py": "867f11693cb2c759f8fb88e6377ce2fba0fb63c876c895b86c7d9c4383eb5f75",
+      "course/methodology/profiles.py": "93ac23b10e21a474ad72732871c58d5395b4c2fe08debc5702463f232fa770b2",
+      "course/methodology/runtime.py": "e2c629d33a60617bab6287e72073d38b13335c9ac82e8084786035e32ee8d158",
+      "course/prompts/course/review.md": "bcd48507a0d78efd8ec9ce2a8fb8a2cb98658f95cca67d40e271b1ae27229f9a",
+      "course/prompts/course/score.md": "939f9a649f1c4d4fa64a245cd35d878284f000aa8426f15abef9822f754ca832",
+      "course/prompts/course/short.md": "ef4cf10434d3e8571b83a23bbe4a48e8d0e502db5f79d9cc2b6adeb924c2b2d8"
+    },
+    "sha256": "ef8e01677bc0a94b31ad6d5e432fce31c69db8c45782e284b9e9b733eba3363e"
+  }
+}

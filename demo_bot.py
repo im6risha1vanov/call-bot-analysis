@@ -6,7 +6,7 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 
 ROOT=Path(__file__).parent
@@ -65,19 +65,22 @@ async def start_command(message):
 
 @router.message(Command('help'))
 async def help_command(message):
+    actor = await resolve_actor(PG_POOL, message.from_user.id) if PG_POOL else None
+    menu = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Сравнить методики')]], resize_keyboard=True, is_persistent=True) if actor and actor.role in {'head', 'owner'} else None
     await message.answer(
         'Звонки разбираются автоматически из Mango — присылать записи не нужно.\n\n'
         '<b>Команды</b>\n'
         '/check &lt;критерий&gt; [дней] — что модель увидела по критерию (руководителю)\n'
         '/assign_train &lt;добавочный&gt; [режим] — назначить тренировку в тренажёре (руководителю)\n'
         '/trainings — последние тренировки, /training &lt;номер&gt; — одна подробно\n'
+        '/compare_analysis — сравнить две методики на двух последних звонках (руководителю)\n'
         '/methodology &lt;номер звонка&gt; — отдельный разбор по курсу\n'
         '/methodology_training &lt;номер&gt; — разбор тренировки по курсу\n'
         '/methodology_stats &lt;начало&gt; &lt;конец&gt; [добавочный] — наблюдения по курсу\n'
         '/approvals — задачи, ждущие подтверждения (руководителю)\n\n'
         'Свободный текст — вопрос по отделу.\n'
         'id этого чата: <code>{}</code>'.format(message.chat.id),
-        parse_mode='HTML')
+        parse_mode='HTML', reply_markup=menu)
 
 # --------------------------------------------------------- тренажёр возражений
 # Сама тренировка живёт в отдельном боте (training_bot.py).
@@ -565,6 +568,10 @@ async def methodology_stats_command(message: Message):
         lines.append('Наблюдений за этот период пока нет.')
     await send_plain(message, '\n'.join(lines))
 
+from comparison.ui import install as install_comparison
+install_comparison(router, lambda: PG_POOL)
+
+
 @router.message(F.text)
 async def rop_question(message: Message):
     """Свободный вопрос агенту РОПа (Этап 3). Регистрируется после команд —
@@ -577,6 +584,14 @@ async def rop_question(message: Message):
     actor = await resolve_actor(PG_POOL, message.from_user.id)
     if actor is None:
         return
+
+    if actor.role in {'head', 'owner'}:
+        from comparison.store import comment as comparison_comment
+        from comparison.presentation import completion_keyboard
+        comparison_id = await comparison_comment(PG_POOL, actor, message.text or '')
+        if comparison_id:
+            await message.answer('Комментарий к сравнению сохранён.', reply_markup=await completion_keyboard(PG_POOL, comparison_id))
+            return
 
     status = await message.answer('Секунду, смотрю данные…')
     try:
